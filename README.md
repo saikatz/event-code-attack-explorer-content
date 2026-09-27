@@ -7,6 +7,10 @@ Installed copies of the app check this file automatically (at startup and every 
 - **Author:** saikatz
 - **Content file:** [`events.json`](events.json) (raw link used by the app: `https://raw.githubusercontent.com/saikatz/event-code-attack-explorer-content/main/events.json`)
 
+## Security
+
+Every `events.json` here is published with `events.json.sig`, a digital signature by the author. The app checks it and rejects any content that was not signed by the author, so edits to this repository alone cannot change what students see. See [SECURITY.md](SECURITY.md) to report a problem privately.
+
 ## Disclaimer
 
 This is a community educational project provided "as is", without warranty of any kind. The author and contributors are not responsible or liable for any damages, losses, outages, security incidents or legal consequences arising from the use or misuse of the app or this content. Use it at your own risk.
