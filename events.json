@@ -1,0 +1,3128 @@
+{
+  "content_version": "1.0.0",
+  "updated": "2026-09-27",
+  "events": [
+    {
+      "id": "4624",
+      "name": "An account was successfully logged on",
+      "log_source": "Security",
+      "category": "Logon / Authentication",
+      "description": "Recorded on the machine that was accessed whenever a logon session is created. The Logon Type field tells you how the user logged on (2 = interactive, 3 = network, 4 = batch, 5 = service, 7 = unlock, 9 = new credentials, 10 = remote desktop, 11 = cached). It is the backbone of almost every lateral movement investigation.",
+      "how_to_enable": [
+        "Open Group Policy Management and edit a GPO linked to the target computers.",
+        "Go to Computer Configuration > Policies > Windows Settings > Security Settings > Advanced Audit Policy Configuration > Logon/Logoff.",
+        "Enable 'Audit Logon' for Success and Failure.",
+        "Run 'gpupdate /force' on a test host, then confirm with 'auditpol /get /subcategory:Logon'.",
+        "Forward the Security log to your SIEM with Windows Event Forwarding or an agent."
+      ],
+      "key_fields": [
+        {
+          "field": "LogonType",
+          "why": "How the session was created; drives almost every detection."
+        },
+        {
+          "field": "TargetUserName / TargetDomainName",
+          "why": "The account that logged on."
+        },
+        {
+          "field": "IpAddress / WorkstationName",
+          "why": "Where the logon came from."
+        },
+        {
+          "field": "AuthenticationPackageName / LmPackageName",
+          "why": "NTLM vs Kerberos; NTLM where Kerberos is expected is a red flag."
+        },
+        {
+          "field": "LogonProcessName",
+          "why": "Unusual values (e.g. seclogo) indicate alternate credentials."
+        },
+        {
+          "field": "ElevatedToken",
+          "why": "Shows whether the session holds admin rights."
+        }
+      ],
+      "related": [
+        "4625",
+        "4648",
+        "4672",
+        "4776"
+      ],
+      "attacks": [
+        {
+          "name": "Pass-the-Hash",
+          "mitre_id": "T1550.002",
+          "tactic": "Lateral Movement",
+          "severity": "High",
+          "summary": "An adversary who has stolen an account's NTLM password hash uses it to authenticate to other machines without ever knowing the clear-text password.",
+          "indicators": [
+            "Logon Type 3 (network) or 9 (new credentials) using NTLM on a host where Kerberos is normal.",
+            "Logon Type 9 with LogonProcessName 'seclogo' on the source host.",
+            "The same account authenticating to many hosts within minutes.",
+            "Admin accounts logging on from workstations that are not admin jump hosts."
+          ],
+          "false_positives": [
+            "Legacy apps or devices that only support NTLM.",
+            "Local accounts used by IT tooling."
+          ],
+          "detection_flow": [
+            "4624 collected",
+            "Filter NTLM + Type 3/9",
+            "Compare to baseline",
+            "Count hosts per account",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4624 from all servers and workstations, not only domain controllers.",
+              "Filter to LogonType 3 or 9 where AuthenticationPackageName is NTLM.",
+              "Exclude known NTLM-only systems and service accounts using an allow-list you maintain.",
+              "Count distinct destination hosts per account over a short window (e.g. 15 minutes).",
+              "Alert when a privileged account uses NTLM from a non-admin workstation or fans out to many hosts."
+            ],
+            "investigate": [
+              "Identify the source IP/workstation and confirm who was physically using it.",
+              "Pull 4688/Sysmon 1 process activity on the source host around the logon time.",
+              "Check whether the account showed Sysmon 10 (LSASS access) activity earlier on any host.",
+              "List every host the account touched in the last 24 hours to scope the spread."
+            ],
+            "respond": [
+              "Isolate the source host from the network.",
+              "Reset the affected account's password twice (to invalidate old hashes) and revoke sessions.",
+              "Hunt for the same account's logons on other hosts and contain them."
+            ],
+            "prevent": [
+              "Deploy Microsoft LAPS so local admin passwords are unique per machine.",
+              "Add admins to the Protected Users group and use tiered admin workstations.",
+              "Restrict and audit NTLM (Network security: Restrict NTLM policies) and enable Credential Guard."
+            ]
+          },
+          "pseudocode": [
+            "WINDOW = 15 minutes",
+            "FOR EACH event IN Security WHERE EventID == 4624",
+            "    IF event.LogonType IN (3, 9) AND event.AuthenticationPackageName == \"NTLM\"",
+            "       AND event.TargetUserName NOT IN ntlm_allow_list",
+            "       AND event.TargetUserName NOT ENDS WITH \"$\":",
+            "        hosts = DISTINCT(event.Computer) FOR event.TargetUserName IN WINDOW",
+            "        IF event.TargetUserName IN privileged_accounts",
+            "           AND event.IpAddress NOT IN admin_jump_hosts:",
+            "            ALERT High \"NTLM logon by privileged account from unexpected host\"",
+            "        ELSE IF COUNT(hosts) >= 5:",
+            "            ALERT Medium \"Possible pass-the-hash fan-out\""
+          ]
+        },
+        {
+          "name": "Lateral Movement over RDP",
+          "mitre_id": "T1021.001",
+          "tactic": "Lateral Movement",
+          "severity": "Medium",
+          "summary": "Adversaries with valid credentials use Remote Desktop to move interactively between machines, often in a chain from one compromised host to the next.",
+          "indicators": [
+            "Logon Type 10 (RemoteInteractive) to servers or workstations that rarely receive RDP.",
+            "RDP from a workstation to another workstation (user-to-user machines).",
+            "RDP chains: host A to B, then B to C within a short period by the same account.",
+            "RDP logons outside business hours or from unusual source IPs."
+          ],
+          "false_positives": [
+            "Helpdesk remote support.",
+            "Admins managing servers from jump hosts."
+          ],
+          "detection_flow": [
+            "4624 Type 10",
+            "Enrich source/dest roles",
+            "Check first-seen pair",
+            "Detect chains",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Filter 4624 to LogonType 10 and record (account, source IP, destination host).",
+              "Build a 30-day baseline of normal account/source/destination combinations.",
+              "Flag first-seen combinations, especially workstation-to-workstation RDP.",
+              "Correlate consecutive RDP hops by the same account to detect chains."
+            ],
+            "investigate": [
+              "Confirm with the account owner whether the session was expected.",
+              "Review TerminalServices-LocalSessionManager/Operational (21, 24, 25) for session details.",
+              "Check processes started in the RDP session (4688 / Sysmon 1)."
+            ],
+            "respond": [
+              "Disconnect the session and disable the account if unauthorized.",
+              "Isolate hosts along the chain and review them for persistence."
+            ],
+            "prevent": [
+              "Allow RDP only from dedicated jump hosts using host firewall rules.",
+              "Require MFA for RDP and enable Network Level Authentication.",
+              "Remove broad 'Remote Desktop Users' memberships."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4624 AND LogonType == 10",
+            "    pair = (event.TargetUserName, event.IpAddress, event.Computer)",
+            "    IF pair NOT IN baseline_30_days:",
+            "        score = 1",
+            "        IF role(event.IpAddress) == \"workstation\" AND role(event.Computer) == \"workstation\": score += 2",
+            "        IF hour(event.Time) NOT IN business_hours: score += 1",
+            "        IF EXISTS prior RDP logon BY same user TO host(event.IpAddress) WITHIN 60 minutes: score += 2",
+            "        IF score >= 3: ALERT Medium \"Unusual RDP lateral movement\" WITH score"
+          ]
+        },
+        {
+          "name": "Abuse of Valid Accounts (anomalous logon)",
+          "mitre_id": "T1078",
+          "tactic": "Initial Access / Persistence",
+          "severity": "Medium",
+          "summary": "Adversaries sign in with legitimate but stolen credentials so their activity blends in with normal users. The logon itself succeeds, so only context (time, place, behavior) reveals it.",
+          "indicators": [
+            "Logons at unusual hours for that user.",
+            "Logons from a new source host, subnet, or country (for VPN/remote gateways).",
+            "Dormant or disabled-then-re-enabled accounts suddenly logging on.",
+            "Service accounts logging on interactively (Type 2 or 10)."
+          ],
+          "false_positives": [
+            "Travel and shift changes.",
+            "New devices issued to users."
+          ],
+          "detection_flow": [
+            "4624 events",
+            "Per-user baseline",
+            "Score anomalies",
+            "Threshold",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Build per-user baselines of normal hours, source hosts and logon types.",
+              "Flag service accounts with LogonType 2 or 10.",
+              "Flag logons by accounts with no activity for 30+ days.",
+              "Combine anomalies into a score to reduce noise."
+            ],
+            "investigate": [
+              "Contact the user through a separate channel to verify.",
+              "Review what the session did: processes, file shares, further logons."
+            ],
+            "respond": [
+              "Reset credentials and terminate active sessions.",
+              "Review MFA registrations and remove unknown devices."
+            ],
+            "prevent": [
+              "Enforce MFA for remote access and privileged accounts.",
+              "Disable dormant accounts automatically.",
+              "Deny interactive logon rights to service accounts via GPO."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4624 AND LogonType IN (2, 3, 10)",
+            "    u = event.TargetUserName",
+            "    score = 0",
+            "    IF hour(event.Time) NOT IN usual_hours[u]: score += 1",
+            "    IF event.IpAddress NOT IN usual_sources[u]: score += 1",
+            "    IF days_since_last_logon(u) > 30: score += 2",
+            "    IF u IN service_accounts AND event.LogonType IN (2, 10): score += 3",
+            "    IF score >= 3: ALERT Medium \"Anomalous logon for \" + u"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4625",
+      "name": "An account failed to log on",
+      "log_source": "Security",
+      "category": "Logon / Authentication",
+      "description": "Logged on the target machine when a logon attempt fails. The Status and SubStatus codes explain why (e.g. 0xC000006A = wrong password, 0xC0000064 = user does not exist, 0xC0000234 = account locked). Patterns of failures are the primary evidence of password-guessing attacks.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy Configuration > Logon/Logoff > Audit Logon.",
+        "Enable Failure (and Success) auditing.",
+        "Confirm with 'auditpol /get /subcategory:Logon'.",
+        "Forward Security logs from domain controllers, RDP-exposed servers and VPN gateways first."
+      ],
+      "key_fields": [
+        {
+          "field": "Status / SubStatus",
+          "why": "Reason for the failure (bad password, unknown user, locked, etc.)."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "The account being tried."
+        },
+        {
+          "field": "IpAddress / WorkstationName",
+          "why": "Origin of the attempts."
+        },
+        {
+          "field": "LogonType",
+          "why": "3 = network (SMB), 10 = RDP; tells you the attacked service."
+        }
+      ],
+      "related": [
+        "4624",
+        "4740",
+        "4771",
+        "4776"
+      ],
+      "attacks": [
+        {
+          "name": "Brute Force (password guessing)",
+          "mitre_id": "T1110.001",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "An adversary repeatedly tries many passwords against one or a few accounts, hoping one is correct. Commonly aimed at internet-exposed RDP or SMB.",
+          "indicators": [
+            "Many 4625 events for the same account from the same source in a short time.",
+            "SubStatus 0xC000006A (bad password) repeated.",
+            "A 4624 for that account from the same source right after the failures (success after guessing)."
+          ],
+          "false_positives": [
+            "A user with a saved, outdated password on a phone or mapped drive.",
+            "Misconfigured scheduled tasks or services."
+          ],
+          "detection_flow": [
+            "4625 collected",
+            "Group by user+source",
+            "Count in window",
+            "Check for 4624 after",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4625 from exposed servers and domain controllers.",
+              "Group failures by TargetUserName and IpAddress in a 5-10 minute window.",
+              "Alert when the count exceeds your threshold (e.g. 20).",
+              "Raise severity if a 4624 success follows from the same source."
+            ],
+            "investigate": [
+              "Look up the source IP: internal host, VPN pool, or internet?",
+              "Check whether the account was locked (4740) or successfully logged on (4624).",
+              "If a success followed, review everything that session did."
+            ],
+            "respond": [
+              "Block the source IP at the firewall.",
+              "Reset the password if any success occurred and review the account."
+            ],
+            "prevent": [
+              "Never expose RDP directly to the internet; use VPN or RD Gateway with MFA.",
+              "Configure account lockout thresholds.",
+              "Enforce long passphrases and ban common passwords."
+            ]
+          },
+          "pseudocode": [
+            "WINDOW = 10 minutes; THRESHOLD = 20",
+            "FOR EACH (user, src) IN GROUP Security WHERE EventID == 4625 BY TargetUserName, IpAddress OVER WINDOW",
+            "    fails = COUNT(events)",
+            "    IF fails >= THRESHOLD:",
+            "        success = EXISTS Security EventID == 4624 WHERE TargetUserName == user",
+            "                  AND IpAddress == src AND Time > last_failure WITHIN 30 minutes",
+            "        IF success: ALERT Critical \"Brute force succeeded for \" + user",
+            "        ELSE:       ALERT High \"Brute force against \" + user + \" from \" + src"
+          ]
+        },
+        {
+          "name": "Password Spraying",
+          "mitre_id": "T1110.003",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "Instead of many passwords against one account, the adversary tries one or two common passwords against many accounts. This stays under lockout thresholds, so each account shows only a few failures.",
+          "indicators": [
+            "One source producing failures across many different usernames.",
+            "Few failures per account (1-3) but many accounts.",
+            "SubStatus 0xC0000064 (user does not exist) mixed in, from guessed usernames.",
+            "Attempts arriving in waves spaced out over hours."
+          ],
+          "false_positives": [
+            "Shared kiosk or terminal servers with many users.",
+            "Vulnerability scanners."
+          ],
+          "detection_flow": [
+            "4625 collected",
+            "Group by source",
+            "Count distinct users",
+            "Low per-user count",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Group 4625 by IpAddress over 30-60 minutes.",
+              "Count distinct TargetUserName values per source.",
+              "Alert when distinct users is high (e.g. >= 10) while failures per user stay low.",
+              "Also run the same logic on 4771 (Kerberos) and 4776 (NTLM) on domain controllers."
+            ],
+            "investigate": [
+              "Identify which accounts, if any, had a successful logon from the same source.",
+              "Check whether the source is a known scanner or kiosk.",
+              "Look for the same pattern from other sources (distributed spray)."
+            ],
+            "respond": [
+              "Block the source and force password resets for any account that succeeded.",
+              "Notify users whose accounts were targeted if passwords were weak."
+            ],
+            "prevent": [
+              "Use banned-password lists (e.g. Entra Password Protection).",
+              "Require MFA on all externally reachable authentication.",
+              "Alert on user-enumeration errors (0xC0000064) from a single source."
+            ]
+          },
+          "pseudocode": [
+            "WINDOW = 60 minutes",
+            "FOR EACH src IN GROUP Security WHERE EventID IN (4625, 4771, 4776) AND failed BY IpAddress OVER WINDOW",
+            "    users = DISTINCT(TargetUserName)",
+            "    avg_per_user = COUNT(events) / COUNT(users)",
+            "    IF COUNT(users) >= 10 AND avg_per_user <= 3 AND src NOT IN scanner_allow_list:",
+            "        winners = users WITH EventID 4624 FROM src WITHIN WINDOW",
+            "        ALERT High \"Password spray from \" + src + \" (\" + COUNT(users) + \" accounts)\"",
+            "        IF winners NOT EMPTY: ESCALATE Critical WITH winners"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4648",
+      "name": "A logon was attempted using explicit credentials",
+      "log_source": "Security",
+      "category": "Logon / Authentication",
+      "description": "Logged on the source machine when a process logs on with credentials different from the currently logged-on user, for example 'Run as' or connecting to a remote host with another account. It shows who initiated the action and which account they used.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy Configuration > Logon/Logoff > Audit Logon (Success).",
+        "Confirm with 'auditpol /get /subcategory:Logon'.",
+        "Collect from workstations and servers; 4648 is recorded on the machine where the action starts."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "The user who ran the action."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "The credentials that were used."
+        },
+        {
+          "field": "TargetServerName",
+          "why": "Where those credentials were sent."
+        },
+        {
+          "field": "ProcessName",
+          "why": "Which program used the credentials."
+        }
+      ],
+      "related": [
+        "4624",
+        "4672"
+      ],
+      "attacks": [
+        {
+          "name": "Lateral Movement with Alternate Credentials",
+          "mitre_id": "T1078 / T1021",
+          "tactic": "Lateral Movement",
+          "severity": "Medium",
+          "summary": "After harvesting credentials, adversaries use them from an already-compromised machine to reach other systems. The source host records the use of credentials that do not belong to the logged-in user.",
+          "indicators": [
+            "A standard user session using a privileged account's credentials.",
+            "Unusual ProcessName values (scripting hosts, unknown binaries) using explicit credentials.",
+            "One source using many different TargetUserName values."
+          ],
+          "false_positives": [
+            "Admins using 'Run as' legitimately.",
+            "Backup and management tools."
+          ],
+          "detection_flow": [
+            "4648 on source",
+            "Subject != Target",
+            "Check process",
+            "Check target account",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4648 from workstations (the source side of lateral movement).",
+              "Keep events where SubjectUserName differs from TargetUserName and TargetServerName is not localhost.",
+              "Flag when TargetUserName is privileged but the Subject is not an admin.",
+              "Flag unusual ProcessName values compared to a baseline."
+            ],
+            "investigate": [
+              "Match the 4648 on the source with 4624 (Type 3) on the TargetServerName.",
+              "Determine how the subject obtained the other account's credentials."
+            ],
+            "respond": [
+              "Reset the exposed credentials.",
+              "Contain both the source and destination hosts."
+            ],
+            "prevent": [
+              "Separate admin and daily-use accounts, and restrict where admin accounts may log on.",
+              "Use Credential Guard to reduce credential theft."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4648",
+            "    IF event.SubjectUserName != event.TargetUserName",
+            "       AND event.TargetServerName NOT IN (\"localhost\", event.Computer):",
+            "        score = 0",
+            "        IF event.TargetUserName IN privileged_accounts AND event.SubjectUserName NOT IN admins: score += 2",
+            "        IF event.ProcessName NOT IN known_processes_for_4648: score += 1",
+            "        IF COUNT DISTINCT TargetUserName FROM event.Computer IN 1 hour >= 3: score += 2",
+            "        IF score >= 2: ALERT Medium \"Suspicious explicit-credential use\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4672",
+      "name": "Special privileges assigned to new logon",
+      "log_source": "Security",
+      "category": "Privilege Use",
+      "description": "Logged right after 4624 when the new session receives sensitive privileges such as SeDebugPrivilege or SeTakeOwnershipPrivilege. In practice it marks an administrator-level logon.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy Configuration > Logon/Logoff > Audit Special Logon (Success).",
+        "Confirm with 'auditpol /get /subcategory:\"Special Logon\"'."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "Account receiving the privileges."
+        },
+        {
+          "field": "PrivilegeList",
+          "why": "Which sensitive rights were granted."
+        },
+        {
+          "field": "SubjectLogonId",
+          "why": "Links to the matching 4624 for source details."
+        }
+      ],
+      "related": [
+        "4624",
+        "4728",
+        "4732"
+      ],
+      "attacks": [
+        {
+          "name": "Privileged Account Misuse",
+          "mitre_id": "T1078.002",
+          "tactic": "Privilege Escalation",
+          "severity": "High",
+          "summary": "Adversaries who gain or create admin-level accounts use them on hosts where those accounts normally never appear. Each such logon generates 4672, making it a good tripwire.",
+          "indicators": [
+            "4672 for an account that has never had admin rights before.",
+            "Domain admin accounts receiving privileges on workstations.",
+            "4672 for newly created accounts."
+          ],
+          "false_positives": [
+            "New admin staff.",
+            "Built-in SYSTEM and service logons (filter them out)."
+          ],
+          "detection_flow": [
+            "4672 collected",
+            "Drop SYSTEM/services",
+            "Join with 4624",
+            "Compare to admin list",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Exclude SYSTEM, LOCAL SERVICE, NETWORK SERVICE and computer accounts ($).",
+              "Join to 4624 using SubjectLogonId to get LogonType and source IP.",
+              "Alert when the account is not on your approved admin list.",
+              "Alert when Tier-0 accounts (domain admins) appear on non-Tier-0 hosts."
+            ],
+            "investigate": [
+              "Check when the account gained admin rights (4728, 4732, 4756).",
+              "Review what the privileged session executed."
+            ],
+            "respond": [
+              "Remove unauthorized group memberships and reset the account.",
+              "Review for persistence created during the session."
+            ],
+            "prevent": [
+              "Implement a tiered administration model.",
+              "Use 'Deny log on' rights to keep Tier-0 accounts off workstations."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4672",
+            "    u = event.SubjectUserName",
+            "    IF u IN (\"SYSTEM\", \"LOCAL SERVICE\", \"NETWORK SERVICE\") OR u ENDS WITH \"$\": CONTINUE",
+            "    logon = FIND 4624 WHERE TargetLogonId == event.SubjectLogonId",
+            "    IF u NOT IN approved_admins:",
+            "        ALERT High \"Unapproved account received admin privileges: \" + u",
+            "    ELSE IF u IN tier0_admins AND event.Computer NOT IN tier0_hosts:",
+            "        ALERT High \"Tier-0 admin logged on to lower-tier host\" WITH logon.IpAddress"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4740",
+      "name": "A user account was locked out",
+      "log_source": "Security",
+      "category": "Account Management",
+      "description": "Logged on domain controllers (and the PDC emulator) when an account exceeds the bad-password threshold. The CallerComputerName field shows which machine generated the bad attempts.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Management > Audit User Account Management (Success).",
+        "Make sure an account lockout policy is configured (Account Policies > Account Lockout Policy)."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "The locked account."
+        },
+        {
+          "field": "CallerComputerName",
+          "why": "The machine where the bad attempts originated."
+        }
+      ],
+      "related": [
+        "4625",
+        "4771",
+        "4776"
+      ],
+      "attacks": [
+        {
+          "name": "Brute Force / Spray causing lockouts",
+          "mitre_id": "T1110",
+          "tactic": "Credential Access",
+          "severity": "Medium",
+          "summary": "Password-guessing attacks often trigger lockouts. A burst of lockouts across many accounts, or from a single caller computer, is a strong sign of an ongoing attack or a denial-of-service against users.",
+          "indicators": [
+            "Several accounts locked out within minutes.",
+            "Many lockouts pointing to the same CallerComputerName.",
+            "Lockouts of privileged or service accounts."
+          ],
+          "false_positives": [
+            "Stale passwords on mobile devices or services after a password change."
+          ],
+          "detection_flow": [
+            "4740 on DCs",
+            "Group by caller",
+            "Count accounts",
+            "Check privileged",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4740 from all domain controllers.",
+              "Count distinct locked accounts over 15 minutes, overall and per CallerComputerName.",
+              "Alert when the count exceeds a threshold (e.g. 5), or immediately for privileged accounts."
+            ],
+            "investigate": [
+              "Go to CallerComputerName and review its 4625/4771/4776 activity and running processes.",
+              "Check whether the source is a legitimate device with a stale password."
+            ],
+            "respond": [
+              "Contain the caller computer if malicious.",
+              "Unlock accounts only after the source is dealt with."
+            ],
+            "prevent": [
+              "Use smart lockout (e.g. Entra) or reasonable thresholds with observation windows.",
+              "Enforce MFA and strong passwords."
+            ]
+          },
+          "pseudocode": [
+            "WINDOW = 15 minutes",
+            "lockouts = Security WHERE EventID == 4740 OVER WINDOW",
+            "IF COUNT DISTINCT(lockouts.TargetUserName) >= 5:",
+            "    ALERT Medium \"Mass lockouts: possible password spray\"",
+            "FOR EACH caller IN GROUP lockouts BY CallerComputerName",
+            "    IF COUNT DISTINCT(TargetUserName) >= 3: ALERT High \"Lockouts sourced from \" + caller",
+            "FOR EACH e IN lockouts WHERE e.TargetUserName IN privileged_accounts",
+            "    ALERT High \"Privileged account locked out: \" + e.TargetUserName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4776",
+      "name": "The computer attempted to validate the credentials for an account (NTLM)",
+      "log_source": "Security",
+      "category": "Logon / Authentication",
+      "description": "Logged on the domain controller (or the local machine for local accounts) whenever NTLM credential validation happens. The Error Code shows success (0x0) or the failure reason. It is the DC-side view of NTLM authentication.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Logon > Audit Credential Validation (Success, Failure).",
+        "Confirm with 'auditpol /get /subcategory:\"Credential Validation\"'."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "The account being validated."
+        },
+        {
+          "field": "Workstation",
+          "why": "The client that sent the NTLM request."
+        },
+        {
+          "field": "Status (Error Code)",
+          "why": "0xC000006A bad password, 0xC0000064 unknown user, 0x0 success."
+        }
+      ],
+      "related": [
+        "4624",
+        "4625",
+        "4740"
+      ],
+      "attacks": [
+        {
+          "name": "NTLM Password Guessing against the Domain",
+          "mitre_id": "T1110",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "Guessing attacks that use NTLM show up on the domain controller as failed credential validations, even when the target member servers do not forward their logs.",
+          "indicators": [
+            "Many failed 4776 events from one Workstation value.",
+            "Many different accounts with failures from one Workstation (spray).",
+            "Error 0xC0000064 bursts (username enumeration)."
+          ],
+          "false_positives": [
+            "Applications with stored stale credentials."
+          ],
+          "detection_flow": [
+            "4776 on DCs",
+            "Filter failures",
+            "Group by workstation",
+            "Threshold",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4776 from all domain controllers.",
+              "Keep failures (Status != 0x0).",
+              "Group by Workstation and count total failures and distinct accounts.",
+              "Alert on high counts; alert separately on enumeration errors."
+            ],
+            "investigate": [
+              "Find the host behind the Workstation name and review its activity.",
+              "Look for any 0x0 successes for the targeted accounts afterwards."
+            ],
+            "respond": [
+              "Contain the source host.",
+              "Reset any account that may have been guessed."
+            ],
+            "prevent": [
+              "Reduce NTLM usage and move to Kerberos.",
+              "Enforce MFA and strong passwords."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH ws IN GROUP Security WHERE EventID == 4776 AND Status != \"0x0\" BY Workstation OVER 30 minutes",
+            "    fails = COUNT(events); users = DISTINCT(TargetUserName)",
+            "    enum = COUNT(events WHERE Status == \"0xC0000064\")",
+            "    IF fails >= 30:            ALERT High \"NTLM brute force from \" + ws",
+            "    IF COUNT(users) >= 10:     ALERT High \"NTLM spray from \" + ws",
+            "    IF enum >= 10:             ALERT Medium \"Username enumeration from \" + ws"
+          ]
+        },
+        {
+          "name": "Pass-the-Hash (DC view)",
+          "mitre_id": "T1550.002",
+          "tactic": "Lateral Movement",
+          "severity": "High",
+          "summary": "When stolen NTLM hashes are replayed against domain resources, the domain controller validates them via NTLM. Privileged accounts validated from unusual workstations are a key clue.",
+          "indicators": [
+            "Successful 4776 for admin accounts from workstations that are not admin hosts.",
+            "NTLM validation for accounts that normally only use Kerberos."
+          ],
+          "false_positives": [
+            "Legacy systems requiring NTLM."
+          ],
+          "detection_flow": [
+            "4776 success",
+            "Privileged account?",
+            "Expected workstation?",
+            "Correlate 4624",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Keep successful 4776 events for privileged accounts.",
+              "Compare Workstation against the list of approved admin hosts.",
+              "Correlate with 4624 Type 3 NTLM on member servers."
+            ],
+            "investigate": [
+              "Review the source workstation for credential-theft activity (Sysmon 10 on LSASS)."
+            ],
+            "respond": [
+              "Reset the account's password twice and isolate the workstation."
+            ],
+            "prevent": [
+              "Put admins in Protected Users (blocks NTLM for them).",
+              "Use LAPS and Credential Guard."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4776 AND Status == \"0x0\"",
+            "    IF event.TargetUserName IN privileged_accounts",
+            "       AND event.Workstation NOT IN admin_hosts:",
+            "        ALERT High \"Privileged NTLM auth from unexpected workstation\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4768",
+      "name": "A Kerberos authentication ticket (TGT) was requested",
+      "log_source": "Security",
+      "category": "Kerberos",
+      "description": "Logged on domain controllers when a client requests a Ticket Granting Ticket, which is the first step of Kerberos logon. The PreAuthType and TicketEncryptionType fields are especially useful for spotting weak or abused authentication.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Logon > Audit Kerberos Authentication Service (Success, Failure).",
+        "Confirm with 'auditpol /get /subcategory:\"Kerberos Authentication Service\"'."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "Account requesting the TGT."
+        },
+        {
+          "field": "IpAddress",
+          "why": "Client that asked for it."
+        },
+        {
+          "field": "PreAuthType",
+          "why": "0 means no pre-authentication was required."
+        },
+        {
+          "field": "TicketEncryptionType",
+          "why": "0x17 (RC4) is weaker and often associated with attacks; 0x12 (AES256) is normal."
+        },
+        {
+          "field": "Status",
+          "why": "0x6 unknown user, 0x18 bad password, 0x0 success."
+        }
+      ],
+      "related": [
+        "4769",
+        "4771",
+        "4738"
+      ],
+      "attacks": [
+        {
+          "name": "AS-REP Roasting",
+          "mitre_id": "T1558.004",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "Accounts configured with 'Do not require Kerberos pre-authentication' can have encrypted material requested for them by anyone. Adversaries take that material offline and try to crack the account's password.",
+          "indicators": [
+            "4768 with PreAuthType = 0 for user accounts.",
+            "RC4 encryption (0x17) on those requests.",
+            "A single source requesting TGTs for several such accounts."
+          ],
+          "false_positives": [
+            "Legacy apps that genuinely need pre-auth disabled (rare; document them)."
+          ],
+          "detection_flow": [
+            "4768 on DCs",
+            "PreAuthType == 0",
+            "Not in exception list",
+            "Group by source",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4768 from every domain controller.",
+              "Filter to PreAuthType = 0 and ignore computer accounts.",
+              "Exclude documented exceptions.",
+              "Alert on any remaining event; raise severity if one source hits several accounts."
+            ],
+            "investigate": [
+              "List all accounts with pre-auth disabled (userAccountControl flag DONT_REQ_PREAUTH).",
+              "Check whether that setting was changed recently (4738).",
+              "Identify the requesting host and review it."
+            ],
+            "respond": [
+              "Re-enable pre-authentication on the affected accounts.",
+              "Reset their passwords to long, random values."
+            ],
+            "prevent": [
+              "Audit regularly for accounts with pre-auth disabled and remove the setting.",
+              "Use 25+ character passwords for any account that must keep it."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4768 AND PreAuthType == 0",
+            "    IF event.TargetUserName ENDS WITH \"$\": CONTINUE",
+            "    IF event.TargetUserName IN preauth_exceptions: CONTINUE",
+            "    ALERT High \"TGT requested without pre-auth (AS-REP roast?) for \" + event.TargetUserName",
+            "    n = COUNT DISTINCT TargetUserName WHERE PreAuthType == 0 AND IpAddress == event.IpAddress IN 1 hour",
+            "    IF n >= 2: ESCALATE Critical \"Multiple AS-REP roastable accounts requested from \" + event.IpAddress"
+          ]
+        },
+        {
+          "name": "Forged or Anomalous Tickets (Golden Ticket context)",
+          "mitre_id": "T1558.001",
+          "tactic": "Credential Access / Persistence",
+          "severity": "Critical",
+          "summary": "If an adversary compromises the KRBTGT account secret, they can forge their own TGTs. Forged TGTs are never requested from the DC, so the tell-tale sign is service-ticket activity (4769) with no matching 4768 before it.",
+          "indicators": [
+            "4769 service ticket requests for an account with no 4768 from the same client in the ticket lifetime.",
+            "Tickets using RC4 in an AES-only environment.",
+            "Account names that do not exist in Active Directory."
+          ],
+          "false_positives": [
+            "Log gaps from a DC that is not forwarding events."
+          ],
+          "detection_flow": [
+            "4769 seen",
+            "Look back for 4768",
+            "None found",
+            "Validate log coverage",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Make sure all DCs forward 4768 and 4769 (gaps cause false positives).",
+              "For each 4769, look back 10 hours for a 4768 by the same account and IP.",
+              "Alert when no TGT request exists.",
+              "Also alert on 4769 for account names not present in AD."
+            ],
+            "investigate": [
+              "Confirm the DC log pipeline was healthy.",
+              "Look for earlier domain-controller compromise: DCSync (4662), NTDS access, admin logons to DCs."
+            ],
+            "respond": [
+              "Treat as full domain compromise; engage incident response.",
+              "Reset the KRBTGT password twice, with replication time between resets."
+            ],
+            "prevent": [
+              "Protect domain controllers as Tier-0.",
+              "Rotate KRBTGT periodically.",
+              "Enforce AES-only Kerberos where possible."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH st IN Security WHERE EventID == 4769",
+            "    acct = strip_realm(st.TargetUserName)",
+            "    IF acct NOT IN ad_accounts: ALERT Critical \"Ticket for non-existent account \" + acct",
+            "    tgt = FIND 4768 WHERE TargetUserName == acct AND IpAddress == st.IpAddress",
+            "          AND Time BETWEEN st.Time - 10 hours AND st.Time",
+            "    IF tgt IS NONE AND dc_logging_healthy(st.Time):",
+            "        ALERT Critical \"Service ticket without TGT request (possible forged TGT)\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4769",
+      "name": "A Kerberos service ticket was requested",
+      "log_source": "Security",
+      "category": "Kerberos",
+      "description": "Logged on domain controllers when a client asks for a service ticket (TGS) to access a specific service, identified by its Service Principal Name. The requested encryption type reveals attempts to obtain weakly encrypted tickets.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Logon > Audit Kerberos Service Ticket Operations (Success, Failure).",
+        "This event is high volume; plan SIEM capacity or filter at collection."
+      ],
+      "key_fields": [
+        {
+          "field": "ServiceName",
+          "why": "The service account the ticket is for."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "Who requested it."
+        },
+        {
+          "field": "TicketEncryptionType",
+          "why": "0x17 (RC4) requests for user service accounts are suspicious."
+        },
+        {
+          "field": "IpAddress",
+          "why": "The requesting client."
+        }
+      ],
+      "related": [
+        "4768",
+        "4624"
+      ],
+      "attacks": [
+        {
+          "name": "Kerberoasting",
+          "mitre_id": "T1558.003",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "Any domain user can request service tickets for accounts that have an SPN. Part of the ticket is encrypted with the service account's password, so adversaries request tickets and try to crack weak service-account passwords offline.",
+          "indicators": [
+            "Service tickets requested with RC4 (0x17) for user-based service accounts.",
+            "One user requesting tickets for many different services in a short time.",
+            "Requests for SPNs that are rarely used or are honeypot accounts."
+          ],
+          "false_positives": [
+            "Legacy systems only supporting RC4.",
+            "Service discovery tools run by IT."
+          ],
+          "detection_flow": [
+            "4769 on DCs",
+            "Drop machine & krbtgt",
+            "RC4 + user SPN",
+            "Count per requester",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4769 from all domain controllers.",
+              "Drop requests where ServiceName ends with '$' or is krbtgt.",
+              "Keep TicketEncryptionType 0x17 (RC4).",
+              "Count distinct ServiceName per requester over 1 hour and alert above a threshold (e.g. 5).",
+              "Create a decoy SPN account that is never used; alert on any request for it."
+            ],
+            "investigate": [
+              "Identify the requesting account and host and review recent activity.",
+              "Check the strength and age of the targeted service accounts' passwords."
+            ],
+            "respond": [
+              "Reset passwords of the targeted service accounts to long random values.",
+              "Contain the requesting host."
+            ],
+            "prevent": [
+              "Use Group Managed Service Accounts (gMSA) with automatic 120-character passwords.",
+              "Enforce AES for service accounts and disable RC4 where possible.",
+              "Remove unnecessary SPNs from user accounts."
+            ]
+          },
+          "pseudocode": [
+            "WINDOW = 60 minutes",
+            "reqs = Security WHERE EventID == 4769",
+            "        AND TicketEncryptionType == \"0x17\"",
+            "        AND NOT ServiceName ENDS WITH \"$\" AND ServiceName != \"krbtgt\"",
+            "FOR EACH r IN reqs WHERE r.ServiceName IN honeypot_spns:",
+            "    ALERT Critical \"Honeypot SPN requested by \" + r.TargetUserName",
+            "FOR EACH user IN GROUP reqs BY TargetUserName OVER WINDOW",
+            "    IF COUNT DISTINCT(ServiceName) >= 5: ALERT High \"Possible Kerberoasting by \" + user"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4771",
+      "name": "Kerberos pre-authentication failed",
+      "log_source": "Security",
+      "category": "Kerberos",
+      "description": "Logged on domain controllers when Kerberos pre-authentication fails, most commonly because of a wrong password (Failure Code 0x18). It is the Kerberos equivalent of a failed logon.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Logon > Audit Kerberos Authentication Service (Failure)."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "Account being tried."
+        },
+        {
+          "field": "IpAddress",
+          "why": "Client sending the attempts."
+        },
+        {
+          "field": "Status (Failure Code)",
+          "why": "0x18 = bad password, 0x12 = account disabled/locked."
+        }
+      ],
+      "related": [
+        "4625",
+        "4740",
+        "4768"
+      ],
+      "attacks": [
+        {
+          "name": "Kerberos Password Spraying / Brute Force",
+          "mitre_id": "T1110.003",
+          "tactic": "Credential Access",
+          "severity": "High",
+          "summary": "Guessing passwords through Kerberos avoids generating 4625 on member servers, so defenders who only watch 4625 can miss it. The domain controller still records 4771 for every failure.",
+          "indicators": [
+            "Many 0x18 failures from one IP across many accounts (spray).",
+            "Many 0x18 failures for one account (brute force).",
+            "Failures followed by a 4768 success for the same account."
+          ],
+          "false_positives": [
+            "Devices with cached old passwords."
+          ],
+          "detection_flow": [
+            "4771 on DCs",
+            "Status 0x18",
+            "Group by IP",
+            "Distinct users",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4771 from all domain controllers.",
+              "Keep Status 0x18.",
+              "Group by IpAddress: many distinct users = spray; many failures on one user = brute force.",
+              "Check for 4768 success for targeted accounts afterwards."
+            ],
+            "investigate": [
+              "Identify and review the source host.",
+              "List accounts that succeeded after failures."
+            ],
+            "respond": [
+              "Contain the source.",
+              "Reset passwords of any account that succeeded."
+            ],
+            "prevent": [
+              "Strong password policy with banned-password lists.",
+              "Account lockout policies."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH ip IN GROUP Security WHERE EventID == 4771 AND Status == \"0x18\" BY IpAddress OVER 30 minutes",
+            "    users = DISTINCT(TargetUserName)",
+            "    IF COUNT(users) >= 10: ALERT High \"Kerberos password spray from \" + ip",
+            "    FOR EACH u IN users WHERE COUNT(events FOR u) >= 15:",
+            "        ALERT High \"Kerberos brute force on \" + u + \" from \" + ip"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4720",
+      "name": "A user account was created",
+      "log_source": "Security",
+      "category": "Account Management",
+      "description": "Logged when a new user account is created, either in Active Directory (on a DC) or locally (on the machine). It records who created the account and the new account's attributes.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Account Management > Audit User Account Management (Success, Failure).",
+        "Apply to domain controllers and to member servers/workstations (for local accounts)."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "Name of the new account."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who created it."
+        },
+        {
+          "field": "Computer",
+          "why": "DC = domain account; other host = local account."
+        }
+      ],
+      "related": [
+        "4722",
+        "4724",
+        "4728",
+        "4732"
+      ],
+      "attacks": [
+        {
+          "name": "Create Account for Persistence",
+          "mitre_id": "T1136.001 / T1136.002",
+          "tactic": "Persistence",
+          "severity": "High",
+          "summary": "Adversaries create new local or domain accounts so they can return later even if the original access is removed. Names are often chosen to look like normal service or admin accounts.",
+          "indicators": [
+            "Accounts created by someone who is not part of the identity/helpdesk team.",
+            "Local accounts created on servers or workstations.",
+            "Account creation quickly followed by addition to an admin group (4728/4732).",
+            "Names that imitate built-ins (e.g. 'adm1n', 'support_svc')."
+          ],
+          "false_positives": [
+            "Onboarding processes and provisioning tools."
+          ],
+          "detection_flow": [
+            "4720 collected",
+            "Creator authorized?",
+            "Local or domain?",
+            "Group add follows?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4720 from domain controllers and endpoints.",
+              "Compare SubjectUserName with the list of approved account administrators/provisioning tools.",
+              "Alert on all local account creations on servers.",
+              "Correlate with 4728/4732/4756 for the same TargetUserName within 1 hour."
+            ],
+            "investigate": [
+              "Ask the identity team whether a ticket exists for this account.",
+              "Review the creator's session for other suspicious activity.",
+              "Check whether the new account has logged on (4624)."
+            ],
+            "respond": [
+              "Disable the unauthorized account and remove group memberships.",
+              "Investigate how the creator's credentials were obtained."
+            ],
+            "prevent": [
+              "Limit who can create accounts and use a ticketed provisioning process.",
+              "Block local account creation on endpoints where not required."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4720",
+            "    score = 0",
+            "    IF event.SubjectUserName NOT IN approved_provisioners: score += 2",
+            "    IF event.Computer NOT IN domain_controllers: score += 1          // local account",
+            "    IF EXISTS EventID IN (4728, 4732, 4756) FOR event.TargetUserName WITHIN 60 minutes: score += 2",
+            "    IF score >= 2: ALERT High \"Suspicious account created: \" + event.TargetUserName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4724",
+      "name": "An attempt was made to reset an account's password",
+      "log_source": "Security",
+      "category": "Account Management",
+      "description": "Logged when one account resets another account's password (as opposed to a user changing their own password, which is 4723). Resets of privileged accounts deserve close attention.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Account Management > Audit User Account Management (Success, Failure)."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "Who performed the reset."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "Whose password was reset."
+        }
+      ],
+      "related": [
+        "4720",
+        "4738"
+      ],
+      "attacks": [
+        {
+          "name": "Account Manipulation via Password Reset",
+          "mitre_id": "T1098",
+          "tactic": "Persistence / Privilege Escalation",
+          "severity": "High",
+          "summary": "An adversary with reset rights over other accounts (for example through misconfigured delegated permissions) resets a more powerful account's password and then takes it over.",
+          "indicators": [
+            "Resets of admin or service accounts by non-helpdesk users.",
+            "A reset followed quickly by a logon of the target account from the resetter's host.",
+            "Many resets by one account in a short period."
+          ],
+          "false_positives": [
+            "Helpdesk activity (verify against tickets)."
+          ],
+          "detection_flow": [
+            "4724 collected",
+            "Target privileged?",
+            "Resetter authorized?",
+            "Logon follows?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Alert on any 4724 where TargetUserName is privileged or a service account.",
+              "Alert when SubjectUserName is not in the helpdesk/identity team.",
+              "Correlate with 4624 for TargetUserName from the resetter's IP within 1 hour."
+            ],
+            "investigate": [
+              "Verify a helpdesk ticket exists.",
+              "Review AD permissions that allowed the reset (who has 'Reset password' rights)."
+            ],
+            "respond": [
+              "Reset the account again and secure it.",
+              "Remove excessive delegated rights."
+            ],
+            "prevent": [
+              "Audit AD ACLs regularly to find over-delegation.",
+              "Protect admin accounts with AdminSDHolder and tiering."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4724",
+            "    IF event.TargetUserName IN privileged_accounts OR event.TargetUserName IN service_accounts:",
+            "        sev = \"High\"",
+            "        IF event.SubjectUserName NOT IN helpdesk_team: sev = \"Critical\"",
+            "        ALERT sev \"Privileged password reset by \" + event.SubjectUserName",
+            "    ELSE IF COUNT 4724 BY event.SubjectUserName IN 30 minutes >= 10:",
+            "        ALERT Medium \"Bulk password resets\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4728",
+      "name": "A member was added to a security-enabled global group",
+      "log_source": "Security",
+      "category": "Group Management",
+      "description": "Logged on domain controllers when a member is added to a global security group, such as Domain Admins. Universal groups (e.g. Enterprise Admins) generate 4756, and local groups 4732; watch all three.",
+      "aliases": [
+        "4756"
+      ],
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > Account Management > Audit Security Group Management (Success)."
+      ],
+      "key_fields": [
+        {
+          "field": "MemberName",
+          "why": "Account that was added."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "The group that changed."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who made the change."
+        }
+      ],
+      "related": [
+        "4732",
+        "4720",
+        "4672"
+      ],
+      "attacks": [
+        {
+          "name": "Privilege Escalation via Domain Group Membership",
+          "mitre_id": "T1098 / T1078.002",
+          "tactic": "Privilege Escalation / Persistence",
+          "severity": "Critical",
+          "summary": "Adding an account to a powerful group like Domain Admins instantly gives it control of the domain. Adversaries do this to escalate or to keep a backdoor admin account.",
+          "indicators": [
+            "Additions to Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account/Backup/Server Operators.",
+            "Changes made outside a change window or by an unexpected account.",
+            "Additions of newly created accounts."
+          ],
+          "false_positives": [
+            "Approved admin onboarding."
+          ],
+          "detection_flow": [
+            "4728/4756",
+            "Sensitive group?",
+            "Change approved?",
+            "New account?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Maintain a list of sensitive groups (Tier-0 groups).",
+              "Alert on every 4728/4756 where TargetUserName is in that list.",
+              "Increase severity if MemberName was created in the last 7 days."
+            ],
+            "investigate": [
+              "Confirm the change against a change ticket.",
+              "Review the SubjectUserName's session and source host.",
+              "Check whether the new member has logged on to DCs."
+            ],
+            "respond": [
+              "Remove the unauthorized member immediately.",
+              "Reset credentials of both the added account and the changer."
+            ],
+            "prevent": [
+              "Keep sensitive groups nearly empty and use just-in-time privileged access.",
+              "Require approval workflows for Tier-0 group changes."
+            ]
+          },
+          "pseudocode": [
+            "SENSITIVE = [\"Domain Admins\", \"Enterprise Admins\", \"Schema Admins\", \"Administrators\",",
+            "             \"Account Operators\", \"Backup Operators\", \"Server Operators\", \"DnsAdmins\"]",
+            "FOR EACH event IN Security WHERE EventID IN (4728, 4756)",
+            "    IF event.TargetUserName IN SENSITIVE:",
+            "        sev = \"High\"",
+            "        IF account_age(event.MemberName) < 7 days: sev = \"Critical\"",
+            "        IF NOT change_ticket_exists(event): sev = \"Critical\"",
+            "        ALERT sev event.MemberName + \" added to \" + event.TargetUserName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4732",
+      "name": "A member was added to a security-enabled local group",
+      "log_source": "Security",
+      "category": "Group Management",
+      "description": "Logged when a member is added to a local group, such as the local Administrators or Remote Desktop Users group on a machine (or a domain-local group on a DC).",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Account Management > Audit Security Group Management (Success).",
+        "Apply to servers and workstations, not only domain controllers."
+      ],
+      "key_fields": [
+        {
+          "field": "MemberSid / MemberName",
+          "why": "Who was added."
+        },
+        {
+          "field": "TargetUserName",
+          "why": "Local group that changed."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who made the change."
+        }
+      ],
+      "related": [
+        "4728",
+        "4720"
+      ],
+      "attacks": [
+        {
+          "name": "Local Admin Persistence",
+          "mitre_id": "T1098",
+          "tactic": "Persistence / Privilege Escalation",
+          "severity": "High",
+          "summary": "Adversaries add an account they control to a machine's local Administrators or Remote Desktop Users group so they keep privileged or remote access to that machine.",
+          "indicators": [
+            "Additions to local Administrators outside of your management tooling.",
+            "Additions of domain user accounts (rather than approved admin groups).",
+            "Additions to Remote Desktop Users on servers."
+          ],
+          "false_positives": [
+            "GPO/Intune-managed group membership changes.",
+            "IT support granting temporary admin."
+          ],
+          "detection_flow": [
+            "4732 on hosts",
+            "Admins/RDP group?",
+            "Actor = mgmt tool?",
+            "Member expected?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Filter 4732 to Administrators and Remote Desktop Users groups.",
+              "Exclude changes made by your approved management accounts (SCCM, Intune, GPO).",
+              "Alert on the remainder, especially on servers."
+            ],
+            "investigate": [
+              "Check who made the change and from which session.",
+              "Review the added account's activity."
+            ],
+            "respond": [
+              "Remove the member and review the host for further persistence."
+            ],
+            "prevent": [
+              "Manage local group membership centrally with Restricted Groups/Intune.",
+              "Deploy LAPS."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4732",
+            "    IF event.TargetUserName IN (\"Administrators\", \"Remote Desktop Users\")",
+            "       AND event.SubjectUserName NOT IN management_accounts:",
+            "        sev = IF is_server(event.Computer) THEN \"High\" ELSE \"Medium\"",
+            "        ALERT sev \"Local group change on \" + event.Computer + \": \" + event.MemberName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4738",
+      "name": "A user account was changed",
+      "log_source": "Security",
+      "category": "Account Management",
+      "description": "Logged when attributes of a user account change, such as userAccountControl flags, password settings, or SID History. Security-relevant flag changes are a common way to weaken an account.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Account Management > Audit User Account Management (Success)."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetUserName",
+          "why": "The changed account."
+        },
+        {
+          "field": "UserAccountControl / NewUacValue",
+          "why": "Flags such as 'Don't require preauth' or 'Password never expires'."
+        },
+        {
+          "field": "SidHistory",
+          "why": "Changes here can grant hidden privileges."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who changed it."
+        }
+      ],
+      "related": [
+        "4768",
+        "4724",
+        "5136"
+      ],
+      "attacks": [
+        {
+          "name": "Weakening Account Security Settings",
+          "mitre_id": "T1098",
+          "tactic": "Persistence / Credential Access",
+          "severity": "High",
+          "summary": "Adversaries change account settings to make accounts easier to abuse: disabling Kerberos pre-authentication (enabling AS-REP roasting), setting 'password never expires', allowing reversible encryption, or adding SID History.",
+          "indicators": [
+            "UAC change adding 'Don't Require Preauth'.",
+            "UAC change adding 'Password Not Required' or 'Store password using reversible encryption'.",
+            "SidHistory populated outside a domain migration."
+          ],
+          "false_positives": [
+            "Documented legacy-application requirements.",
+            "Domain migrations (SID History)."
+          ],
+          "detection_flow": [
+            "4738 collected",
+            "Parse UAC changes",
+            "Risky flag added?",
+            "Actor approved?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Parse the 'User Account Control' change list in 4738.",
+              "Alert when risky flags are added: Don't Require Preauth, Password Not Required, Reversible Encryption, Trusted for Delegation.",
+              "Alert on any SidHistory change outside migration projects."
+            ],
+            "investigate": [
+              "Confirm the change was requested.",
+              "Check whether the account was then attacked (4768 PreAuthType 0)."
+            ],
+            "respond": [
+              "Revert the flags and reset the password."
+            ],
+            "prevent": [
+              "Regular AD hygiene scans for risky flags.",
+              "Limit who can modify user objects."
+            ]
+          },
+          "pseudocode": [
+            "RISKY = [\"Don't Require Preauth\", \"Password Not Required\",",
+            "         \"Encrypted Text Password Allowed\", \"Trusted For Delegation\"]",
+            "FOR EACH event IN Security WHERE EventID == 4738",
+            "    added = flags_enabled_in(event.UserAccountControl)",
+            "    IF added INTERSECTS RISKY: ALERT High \"Risky flag set on \" + event.TargetUserName + \": \" + added",
+            "    IF event.SidHistory NOT IN (\"-\", \"\") AND NOT migration_active: ALERT Critical \"SID History modified\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4688",
+      "name": "A new process has been created",
+      "log_source": "Security",
+      "category": "Process Execution",
+      "description": "Logged whenever a process starts. With command-line auditing enabled it records the full command line, which makes it one of the most valuable events for detecting malicious execution.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Detailed Tracking > Audit Process Creation (Success).",
+        "Enable Administrative Templates > System > Audit Process Creation > 'Include command line in process creation events'.",
+        "Confirm with 'auditpol /get /subcategory:\"Process Creation\"'.",
+        "Consider Sysmon Event 1 for richer data (hashes, parent command line)."
+      ],
+      "key_fields": [
+        {
+          "field": "NewProcessName",
+          "why": "The program that started."
+        },
+        {
+          "field": "CommandLine",
+          "why": "Arguments; most detections rely on this."
+        },
+        {
+          "field": "ParentProcessName",
+          "why": "What launched it; unusual parents are key signals."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Account running the process."
+        },
+        {
+          "field": "TokenElevationType",
+          "why": "Shows whether it ran elevated."
+        }
+      ],
+      "related": [
+        "4624",
+        "4104",
+        "Sysmon-1"
+      ],
+      "attacks": [
+        {
+          "name": "Malicious Command & Scripting Execution",
+          "mitre_id": "T1059",
+          "tactic": "Execution",
+          "severity": "High",
+          "summary": "Adversaries rely on built-in interpreters such as PowerShell, cmd, wscript and mshta to run their code, because these are already present and trusted on every Windows machine.",
+          "indicators": [
+            "Office apps, browsers or PDF readers spawning cmd, PowerShell, wscript, mshta.",
+            "Encoded or heavily obfuscated command lines.",
+            "Scripts executed from user-writable paths (Downloads, Temp, AppData)."
+          ],
+          "false_positives": [
+            "Admin scripts and software installers.",
+            "Some legitimate add-ins."
+          ],
+          "detection_flow": [
+            "4688 collected",
+            "Interpreter launched",
+            "Check parent",
+            "Check command line",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Enable command-line logging for 4688 (or deploy Sysmon).",
+              "Alert when Office/browser/reader processes are the parent of a script interpreter.",
+              "Alert on command lines with encoding or obfuscation markers.",
+              "Baseline normal interpreter use per host role and alert on deviations."
+            ],
+            "investigate": [
+              "Rebuild the process tree (parent, grandparent, children).",
+              "Look for network connections (Sysmon 3) and files written (Sysmon 11) by the process.",
+              "Collect the document or script that started it."
+            ],
+            "respond": [
+              "Isolate the host.",
+              "Block the delivery vector (email, URL).",
+              "Reset credentials used on the host."
+            ],
+            "prevent": [
+              "Enable Attack Surface Reduction rules (block Office child processes).",
+              "Use application control (WDAC/AppLocker).",
+              "Enable PowerShell Constrained Language Mode for standard users."
+            ]
+          },
+          "pseudocode": [
+            "INTERPRETERS = [\"powershell.exe\", \"pwsh.exe\", \"cmd.exe\", \"wscript.exe\", \"cscript.exe\", \"mshta.exe\"]",
+            "RISKY_PARENTS = [\"winword.exe\", \"excel.exe\", \"outlook.exe\", \"powerpnt.exe\", \"acrord32.exe\", \"chrome.exe\", \"msedge.exe\"]",
+            "FOR EACH event IN Security WHERE EventID == 4688",
+            "    child = basename(event.NewProcessName); parent = basename(event.ParentProcessName)",
+            "    IF child IN INTERPRETERS AND parent IN RISKY_PARENTS:",
+            "        ALERT High \"Script interpreter spawned by \" + parent",
+            "    IF child IN INTERPRETERS AND looks_encoded_or_obfuscated(event.CommandLine):",
+            "        ALERT High \"Obfuscated interpreter command line\"",
+            "    IF path_is_user_writable(event.NewProcessName) AND NOT signed(event.NewProcessName):",
+            "        ALERT Medium \"Unsigned binary executed from user-writable path\""
+          ]
+        },
+        {
+          "name": "Living-off-the-Land Binaries (LOLBins)",
+          "mitre_id": "T1218",
+          "tactic": "Defense Evasion",
+          "severity": "Medium",
+          "summary": "Signed Microsoft binaries (such as rundll32, regsvr32, certutil, mshta) can be misused to download or run code. Because they are trusted, they can slip past basic allow-listing.",
+          "indicators": [
+            "rundll32/regsvr32 loading DLLs from Temp or AppData or referencing URLs.",
+            "certutil or bitsadmin used with URLs.",
+            "These binaries making outbound network connections."
+          ],
+          "false_positives": [
+            "Some installers and management tools use these binaries."
+          ],
+          "detection_flow": [
+            "4688 collected",
+            "LOLBin launched",
+            "URL or odd path?",
+            "Network activity?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Maintain a watch-list of commonly abused signed binaries (see the LOLBAS project).",
+              "Alert when their command line contains URLs or user-writable paths.",
+              "Correlate with Sysmon 3 network connections from the same process."
+            ],
+            "investigate": [
+              "Retrieve any downloaded or loaded files and analyze them.",
+              "Review the parent process chain."
+            ],
+            "respond": [
+              "Isolate the host and remove dropped files."
+            ],
+            "prevent": [
+              "Block unneeded LOLBins with WDAC/AppLocker rules.",
+              "Use ASR rules."
+            ]
+          },
+          "pseudocode": [
+            "LOLBINS = [\"rundll32.exe\", \"regsvr32.exe\", \"certutil.exe\", \"mshta.exe\", \"bitsadmin.exe\", \"msbuild.exe\"]",
+            "FOR EACH event IN Security WHERE EventID == 4688",
+            "    IF basename(event.NewProcessName) IN LOLBINS:",
+            "        IF contains_url(event.CommandLine) OR references_user_writable_path(event.CommandLine):",
+            "            ALERT Medium \"Possible LOLBin abuse: \" + event.NewProcessName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4697",
+      "name": "A service was installed in the system",
+      "log_source": "Security",
+      "category": "Persistence",
+      "description": "Security-log record of a new service installation, including the service file path and account. It complements System event 7045 and is captured by the Security audit pipeline.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > System > Audit Security System Extension (Success)."
+      ],
+      "key_fields": [
+        {
+          "field": "ServiceName",
+          "why": "Name of the new service."
+        },
+        {
+          "field": "ServiceFileName",
+          "why": "The binary or command the service runs."
+        },
+        {
+          "field": "ServiceAccount",
+          "why": "Usually LocalSystem for malicious services."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who installed it."
+        }
+      ],
+      "related": [
+        "7045",
+        "4688"
+      ],
+      "attacks": [
+        {
+          "name": "Malicious Service for Persistence / Remote Execution",
+          "mitre_id": "T1543.003 / T1569.002",
+          "tactic": "Persistence / Execution",
+          "severity": "High",
+          "summary": "Services run automatically with high privileges, so adversaries install them to persist or to run code on remote machines as part of lateral movement.",
+          "indicators": [
+            "Service binaries in Temp, AppData, ProgramData or admin shares.",
+            "Service commands that launch cmd or PowerShell.",
+            "Random-looking service names.",
+            "Service installed shortly after a network logon (4624 Type 3) from another host."
+          ],
+          "false_positives": [
+            "Software installs and updates.",
+            "Remote management tools."
+          ],
+          "detection_flow": [
+            "4697 / 7045",
+            "Check file path",
+            "Check command",
+            "Correlate logon",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4697 and 7045 from all hosts.",
+              "Alert when ServiceFileName points to user-writable paths or includes script interpreters.",
+              "Alert on high-entropy/random service names.",
+              "Correlate with a network logon to the same host within 5 minutes."
+            ],
+            "investigate": [
+              "Collect the service binary and hash it.",
+              "Identify the account and source host that installed it."
+            ],
+            "respond": [
+              "Stop and delete the service.",
+              "Contain the source host of any related remote logon."
+            ],
+            "prevent": [
+              "Limit local admin rights.",
+              "Use application control to block unapproved binaries."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4697   // same logic for System 7045 (ImagePath)",
+            "    path = lower(event.ServiceFileName)",
+            "    score = 0",
+            "    IF path CONTAINS ANY (\"\\\\temp\\\\\", \"\\\\appdata\\\\\", \"\\\\programdata\\\\\", \"\\\\users\\\\public\\\\\"): score += 2",
+            "    IF path CONTAINS ANY (\"cmd.exe\", \"powershell\", \"mshta\", \"rundll32\"): score += 2",
+            "    IF entropy(event.ServiceName) > 3.5: score += 1",
+            "    IF EXISTS 4624 LogonType 3 ON event.Computer WITHIN 5 minutes BEFORE: score += 1",
+            "    IF score >= 2: ALERT High \"Suspicious service installed: \" + event.ServiceName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "7045",
+      "name": "A new service was installed in the system",
+      "log_source": "System",
+      "category": "Persistence",
+      "description": "Logged by the Service Control Manager in the System log whenever a service is created. It is enabled by default, making it one of the most reliable persistence and lateral-movement indicators.",
+      "how_to_enable": [
+        "Enabled by default in the System log.",
+        "Make sure your log collector forwards the System log (Provider: Service Control Manager)."
+      ],
+      "key_fields": [
+        {
+          "field": "ServiceName",
+          "why": "Name of the service."
+        },
+        {
+          "field": "ImagePath",
+          "why": "What the service executes."
+        },
+        {
+          "field": "StartType",
+          "why": "Auto-start services survive reboots."
+        },
+        {
+          "field": "AccountName",
+          "why": "Account the service runs as."
+        }
+      ],
+      "related": [
+        "4697",
+        "4688"
+      ],
+      "attacks": [
+        {
+          "name": "Service-based Persistence and Remote Execution",
+          "mitre_id": "T1543.003 / T1569.002",
+          "tactic": "Persistence / Execution",
+          "severity": "High",
+          "summary": "The same behavior as 4697, seen from the System log. Many remote-execution tools create a temporary service on the target to run commands, and malware creates services to survive reboots.",
+          "indicators": [
+            "ImagePath containing command interpreters or encoded commands.",
+            "ImagePath in unusual directories.",
+            "Services that are created and deleted within minutes.",
+            "Kernel-driver services (type kernel mode driver) from unknown vendors."
+          ],
+          "false_positives": [
+            "Patching, EDR and software deployment tools."
+          ],
+          "detection_flow": [
+            "7045 collected",
+            "Parse ImagePath",
+            "Known-good list",
+            "Score risk",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Forward the System log from all hosts.",
+              "Maintain an allow-list of known service names/paths from your software inventory.",
+              "Score new services using path, command content and name randomness.",
+              "Alert separately on new kernel-driver services."
+            ],
+            "investigate": [
+              "Review the binary and its signature.",
+              "Look for 4624 Type 3 logons shortly before the service creation."
+            ],
+            "respond": [
+              "Remove the service and binary.",
+              "Hunt for the same ImagePath on other hosts."
+            ],
+            "prevent": [
+              "Restrict admin rights.",
+              "Enable vulnerable driver blocklist and HVCI."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN System WHERE EventID == 7045 AND Provider == \"Service Control Manager\"",
+            "    IF (event.ServiceName, event.ImagePath) IN known_good_services: CONTINUE",
+            "    risk = score_service(event.ImagePath, event.ServiceName)   // same scoring as 4697",
+            "    IF event.ServiceType == \"kernel mode driver\" AND NOT trusted_signer(event.ImagePath): risk += 2",
+            "    IF risk >= 2: ALERT High \"Suspicious new service on \" + event.Computer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4698",
+      "name": "A scheduled task was created",
+      "log_source": "Security",
+      "category": "Persistence",
+      "description": "Logged when a scheduled task is registered. The TaskContent field contains the full task XML, including the command it runs, its trigger, and the account it runs as.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Object Access > Audit Other Object Access Events (Success).",
+        "Also consider Microsoft-Windows-TaskScheduler/Operational (event 106) which is easy to enable."
+      ],
+      "key_fields": [
+        {
+          "field": "TaskName",
+          "why": "Name/path of the task."
+        },
+        {
+          "field": "TaskContent",
+          "why": "XML with the command (Exec/Command) and triggers."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who created it."
+        }
+      ],
+      "related": [
+        "4702",
+        "4688",
+        "4624"
+      ],
+      "attacks": [
+        {
+          "name": "Scheduled Task Persistence / Execution",
+          "mitre_id": "T1053.005",
+          "tactic": "Persistence / Execution",
+          "severity": "High",
+          "summary": "Scheduled tasks let adversaries run code at logon, at startup, or on a timer, often as SYSTEM. They are also created remotely to execute code on other machines.",
+          "indicators": [
+            "Task commands running scripts or binaries from user-writable folders.",
+            "Tasks running interpreters with encoded arguments.",
+            "Tasks placed in the root folder with random or imitating names.",
+            "Task created remotely right after a network logon."
+          ],
+          "false_positives": [
+            "Software updaters and IT management tasks."
+          ],
+          "detection_flow": [
+            "4698 collected",
+            "Parse TaskContent",
+            "Inspect command",
+            "Check author/context",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Collect 4698 (and 4702 for modifications).",
+              "Parse the Command and Arguments from TaskContent XML.",
+              "Alert on interpreters, encoded content, or user-writable paths.",
+              "Baseline normal task names per host role."
+            ],
+            "investigate": [
+              "Export the task and the referenced file.",
+              "Identify the creator's logon session and source host."
+            ],
+            "respond": [
+              "Disable and delete the task.",
+              "Remove associated files and hunt for the same task elsewhere."
+            ],
+            "prevent": [
+              "Limit admin rights.",
+              "Use application control."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID IN (4698, 4702)",
+            "    xml = parse_xml(event.TaskContent)",
+            "    cmd = lower(xml.Actions.Exec.Command + \" \" + xml.Actions.Exec.Arguments)",
+            "    score = 0",
+            "    IF cmd CONTAINS ANY (\"powershell\", \"cmd.exe\", \"mshta\", \"wscript\", \"rundll32\"): score += 1",
+            "    IF looks_encoded_or_obfuscated(cmd): score += 2",
+            "    IF references_user_writable_path(cmd): score += 2",
+            "    IF xml.Principals.UserId == \"S-1-5-18\" (SYSTEM): score += 1",
+            "    IF score >= 3: ALERT High \"Suspicious scheduled task: \" + event.TaskName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4104",
+      "name": "PowerShell Script Block Logging",
+      "log_source": "Microsoft-Windows-PowerShell/Operational",
+      "category": "Process Execution",
+      "description": "Records the actual PowerShell code that runs, after de-obfuscation. Even when a command is encoded, the decoded script block is logged, which makes this one of the best sources for detecting malicious PowerShell.",
+      "how_to_enable": [
+        "Edit a GPO: Administrative Templates > Windows Components > Windows PowerShell > Turn on PowerShell Script Block Logging.",
+        "Optionally enable 'Log script block invocation start/stop events' (very noisy).",
+        "Forward the Microsoft-Windows-PowerShell/Operational log.",
+        "Remove PowerShell v2 (it does not support script block logging)."
+      ],
+      "key_fields": [
+        {
+          "field": "ScriptBlockText",
+          "why": "The code that was executed."
+        },
+        {
+          "field": "Path",
+          "why": "Script file path, if any."
+        },
+        {
+          "field": "Level",
+          "why": "Warning level is set automatically when PowerShell flags code as suspicious."
+        }
+      ],
+      "related": [
+        "4688",
+        "Sysmon-1"
+      ],
+      "attacks": [
+        {
+          "name": "Malicious PowerShell",
+          "mitre_id": "T1059.001",
+          "tactic": "Execution",
+          "severity": "High",
+          "summary": "PowerShell is heavily used by adversaries for downloading payloads, running code in memory, reconnaissance and credential theft. Script block logging reveals what the code actually did.",
+          "indicators": [
+            "Script blocks that download and execute content in memory.",
+            "Use of reflection or dynamic compilation to load code.",
+            "Attempts to tamper with security features (AMSI, Defender settings, logging).",
+            "Events logged at Warning level (PowerShell's own suspicious-content flag)."
+          ],
+          "false_positives": [
+            "Admin automation and management agents."
+          ],
+          "detection_flow": [
+            "4104 collected",
+            "Match risky patterns",
+            "Check Warning level",
+            "Score & dedupe",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Enable script block logging everywhere and remove PowerShell v2.",
+              "Alert on events with Level = Warning.",
+              "Match ScriptBlockText against categories of risky behavior: download + execute, in-memory loading, security tampering.",
+              "Reassemble multi-part script blocks (MessageNumber/MessageTotal) before matching."
+            ],
+            "investigate": [
+              "Reconstruct the full script and the parent process (4688/Sysmon 1).",
+              "Check network connections made by powershell.exe (Sysmon 3)."
+            ],
+            "respond": [
+              "Isolate the host.",
+              "Block identified download URLs/domains."
+            ],
+            "prevent": [
+              "Constrained Language Mode via WDAC for standard users.",
+              "Keep AMSI-integrated antivirus enabled.",
+              "Restrict PowerShell remoting to admin hosts."
+            ]
+          },
+          "pseudocode": [
+            "CATEGORIES = {",
+            "  \"download_exec\":  [\"downloadstring\", \"downloaddata\", \"invoke-webrequest\", \"iex\", \"invoke-expression\"],",
+            "  \"in_memory\":      [\"reflection.assembly\", \"::load(\", \"virtualalloc\", \"add-type\"],",
+            "  \"tamper\":         [\"amsiutils\", \"set-mppreference\", \"disablerealtimemonitoring\"]",
+            "}",
+            "FOR EACH block IN reassemble(PowerShell/Operational WHERE EventID == 4104)",
+            "    text = lower(block.ScriptBlockText)",
+            "    hits = [c FOR c IN CATEGORIES IF text CONTAINS ANY CATEGORIES[c]]",
+            "    IF block.Level == \"Warning\": hits.append(\"ps_flagged\")",
+            "    IF \"tamper\" IN hits: ALERT Critical \"Security tampering via PowerShell\"",
+            "    ELSE IF COUNT(hits) >= 2: ALERT High \"Suspicious PowerShell: \" + hits",
+            "    ELSE IF COUNT(hits) == 1: LOG_FOR_HUNTING block"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "1102",
+      "name": "The audit log was cleared",
+      "log_source": "Security",
+      "category": "Defense Evasion",
+      "description": "Logged in the Security log whenever it is cleared. It is always generated (it cannot be turned off) and records who cleared it. Legitimate clearing is rare in well-run environments.",
+      "how_to_enable": [
+        "Always logged; no configuration needed.",
+        "Ensure logs are forwarded off the host so the evidence survives."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "Who cleared the log."
+        },
+        {
+          "field": "SubjectLogonId",
+          "why": "Links to the session (4624) that did it."
+        }
+      ],
+      "related": [
+        "104",
+        "4719"
+      ],
+      "attacks": [
+        {
+          "name": "Clearing Windows Event Logs",
+          "mitre_id": "T1070.001",
+          "tactic": "Defense Evasion",
+          "severity": "Critical",
+          "summary": "Adversaries clear event logs to destroy evidence of their activity. The clear action itself leaves this event behind, and any forwarded copies remain in the SIEM.",
+          "indicators": [
+            "Any 1102 on servers or domain controllers.",
+            "1102 and 104 on multiple hosts within a short period.",
+            "Clearing performed by an account not in the IT operations team."
+          ],
+          "false_positives": [
+            "Lab/test machines being reset.",
+            "Rare maintenance actions (should be ticketed)."
+          ],
+          "detection_flow": [
+            "1102 collected",
+            "Always alert",
+            "Identify session",
+            "Check other hosts",
+            "Escalate"
+          ],
+          "defense": {
+            "detect": [
+              "Forward the Security log in near real time so cleared events are already in the SIEM.",
+              "Alert on every 1102 (and System 104).",
+              "Raise severity if seen on more than one host in an hour."
+            ],
+            "investigate": [
+              "Use SubjectLogonId to find the logon session and its source.",
+              "Review SIEM copies of events from before the clear to see what was hidden.",
+              "Look at 4688/Sysmon 1 for wevtutil or PowerShell log-clearing commands."
+            ],
+            "respond": [
+              "Treat as confirmed malicious unless proven otherwise.",
+              "Contain the host and account."
+            ],
+            "prevent": [
+              "Forward logs centrally (WEF/agent).",
+              "Restrict who holds 'Manage auditing and security log' rights."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 1102",
+            "    ALERT Critical \"Security log cleared on \" + event.Computer + \" by \" + event.SubjectUserName",
+            "    hosts = DISTINCT Computer FROM (Security 1102 UNION System 104) IN 60 minutes",
+            "    IF COUNT(hosts) >= 2: ESCALATE \"Log clearing on multiple hosts\" WITH hosts"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "104",
+      "name": "The System log file was cleared",
+      "log_source": "System",
+      "category": "Defense Evasion",
+      "description": "Logged in the System log (provider Microsoft-Windows-Eventlog) when any event log other than Security is cleared, such as System, Application or PowerShell logs.",
+      "how_to_enable": [
+        "Always logged.",
+        "Forward the System log to your SIEM."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "Who cleared the log."
+        },
+        {
+          "field": "Channel",
+          "why": "Which log was cleared."
+        }
+      ],
+      "related": [
+        "1102"
+      ],
+      "attacks": [
+        {
+          "name": "Clearing Non-Security Logs",
+          "mitre_id": "T1070.001",
+          "tactic": "Defense Evasion",
+          "severity": "High",
+          "summary": "Adversaries often clear the PowerShell, Sysmon or System logs to remove traces of their tools, even when they leave the Security log alone.",
+          "indicators": [
+            "104 for the PowerShell, Sysmon or System channels.",
+            "Clearing shortly after suspicious activity."
+          ],
+          "false_positives": [
+            "Rare admin maintenance."
+          ],
+          "detection_flow": [
+            "104 collected",
+            "Which channel?",
+            "Who cleared?",
+            "Correlate 1102",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Alert on 104 from Provider Microsoft-Windows-Eventlog.",
+              "Raise severity when the channel is PowerShell or Sysmon."
+            ],
+            "investigate": [
+              "Find the user session and what ran just before.",
+              "Review forwarded copies of the cleared log."
+            ],
+            "respond": [
+              "Contain the host and account."
+            ],
+            "prevent": [
+              "Forward all security-relevant channels centrally."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN System WHERE EventID == 104 AND Provider == \"Microsoft-Windows-Eventlog\"",
+            "    sev = \"High\"",
+            "    IF event.Channel CONTAINS ANY (\"PowerShell\", \"Sysmon\"): sev = \"Critical\"",
+            "    ALERT sev event.Channel + \" log cleared on \" + event.Computer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4719",
+      "name": "System audit policy was changed",
+      "log_source": "Security",
+      "category": "Defense Evasion",
+      "description": "Logged when the audit policy of the machine changes, for example when auditing for a subcategory is turned off. Disabling auditing blinds defenders going forward.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Policy Change > Audit Audit Policy Change (Success)."
+      ],
+      "key_fields": [
+        {
+          "field": "SubcategoryGuid / Subcategory",
+          "why": "Which audit area changed."
+        },
+        {
+          "field": "AuditPolicyChanges",
+          "why": "What was added or removed (e.g. 'Success removed')."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who changed it."
+        }
+      ],
+      "related": [
+        "1102",
+        "104"
+      ],
+      "attacks": [
+        {
+          "name": "Disabling Audit Logging",
+          "mitre_id": "T1562.002",
+          "tactic": "Defense Evasion",
+          "severity": "High",
+          "summary": "Rather than clearing logs, adversaries may quietly turn off auditing for categories like logon or process creation, so their later actions are never recorded.",
+          "indicators": [
+            "AuditPolicyChanges showing 'Success removed' or 'Failure removed'.",
+            "Changes not made by the SYSTEM account during GPO refresh.",
+            "Sudden drop in event volume from a host."
+          ],
+          "false_positives": [
+            "Group Policy updates that legitimately change audit settings."
+          ],
+          "detection_flow": [
+            "4719 collected",
+            "Removal?",
+            "Actor = GPO?",
+            "Volume drop?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Alert on 4719 where auditing was removed and the actor is not SYSTEM.",
+              "Monitor per-host event volume and alert on sudden drops (a host going quiet)."
+            ],
+            "investigate": [
+              "Check who made the change and from where.",
+              "Run 'auditpol /get /category:*' on the host."
+            ],
+            "respond": [
+              "Restore audit policy via GPO (gpupdate /force).",
+              "Contain the host."
+            ],
+            "prevent": [
+              "Enforce audit policy via GPO so it re-applies.",
+              "Limit local admin rights."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 4719",
+            "    IF event.AuditPolicyChanges CONTAINS \"removed\" AND event.SubjectUserName NOT ENDS WITH \"$\":",
+            "        ALERT High \"Audit policy weakened on \" + event.Computer + \": \" + event.Subcategory",
+            "EVERY 1 hour:",
+            "    FOR EACH host IN monitored_hosts",
+            "        IF event_rate(host, last_hour) < 0.2 * baseline_rate(host): ALERT Medium \"Host went quiet: \" + host"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4662",
+      "name": "An operation was performed on an object",
+      "log_source": "Security",
+      "category": "Directory Services",
+      "description": "Logged on domain controllers when an audited Active Directory object is accessed. The Properties field contains GUIDs that identify exactly which rights were used, including directory replication rights.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > DS Access > Audit Directory Service Access (Success).",
+        "Configure a SACL on the domain root object to audit the relevant rights."
+      ],
+      "key_fields": [
+        {
+          "field": "SubjectUserName",
+          "why": "Account performing the operation."
+        },
+        {
+          "field": "Properties",
+          "why": "GUIDs of the rights used."
+        },
+        {
+          "field": "ObjectName",
+          "why": "The AD object accessed."
+        }
+      ],
+      "related": [
+        "4624",
+        "5136"
+      ],
+      "attacks": [
+        {
+          "name": "DCSync (directory replication abuse)",
+          "mitre_id": "T1003.006",
+          "tactic": "Credential Access",
+          "severity": "Critical",
+          "summary": "An adversary with replication rights can pretend to be a domain controller and ask a real DC to replicate account password data, obtaining hashes for any account including KRBTGT.",
+          "indicators": [
+            "4662 with replication GUIDs: 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 (DS-Replication-Get-Changes) and 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2 (Get-Changes-All).",
+            "SubjectUserName is a user account (not a DC computer account ending in $).",
+            "Replication requests from an IP that is not a domain controller."
+          ],
+          "false_positives": [
+            "Azure AD Connect / Entra Connect sync account.",
+            "Some identity management tools."
+          ],
+          "detection_flow": [
+            "4662 on DCs",
+            "Replication GUIDs",
+            "Actor not a DC",
+            "Not sync account",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Configure SACL auditing on the domain root and enable DS Access auditing.",
+              "Filter 4662 for the replication GUIDs in Properties.",
+              "Exclude DC computer accounts and documented sync accounts.",
+              "Alert on anything else as Critical. (Network sensors watching DRSUAPI traffic from non-DC IPs add a second layer.)"
+            ],
+            "investigate": [
+              "Find the logon session (4624) and source IP for the SubjectUserName.",
+              "Check how that account received replication rights (5136 ACL changes)."
+            ],
+            "respond": [
+              "Treat as domain compromise: reset KRBTGT twice, reset privileged accounts.",
+              "Remove replication rights from non-DC principals."
+            ],
+            "prevent": [
+              "Audit who holds replication rights regularly.",
+              "Protect Tier-0 accounts and DCs."
+            ]
+          },
+          "pseudocode": [
+            "REPL = [\"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2\", \"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2\",",
+            "        \"89e95b76-444d-4c62-991a-0facbeda640c\"]",
+            "FOR EACH event IN Security WHERE EventID == 4662",
+            "    IF lower(event.Properties) CONTAINS ANY REPL:",
+            "        IF event.SubjectUserName ENDS WITH \"$\" AND event.SubjectUserName IN dc_accounts: CONTINUE",
+            "        IF event.SubjectUserName IN approved_sync_accounts: CONTINUE",
+            "        ALERT Critical \"Possible DCSync by \" + event.SubjectUserName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "5136",
+      "name": "A directory service object was modified",
+      "log_source": "Security",
+      "category": "Directory Services",
+      "description": "Logged on domain controllers when an AD object attribute changes, showing the attribute name and new value. Useful for tracking GPO changes, ACL changes and delegation settings.",
+      "how_to_enable": [
+        "Edit a GPO linked to Domain Controllers: Advanced Audit Policy > DS Access > Audit Directory Service Changes (Success).",
+        "Ensure SACLs exist on the objects you care about (domain root, AdminSDHolder, GPO container)."
+      ],
+      "key_fields": [
+        {
+          "field": "ObjectDN",
+          "why": "Which object changed."
+        },
+        {
+          "field": "AttributeLDAPDisplayName",
+          "why": "Which attribute changed (e.g. nTSecurityDescriptor, gPCFileSysPath)."
+        },
+        {
+          "field": "AttributeValue",
+          "why": "The new value."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Who changed it."
+        }
+      ],
+      "related": [
+        "4662",
+        "4738"
+      ],
+      "attacks": [
+        {
+          "name": "Domain Policy / ACL Modification",
+          "mitre_id": "T1484.001 / T1222.001",
+          "tactic": "Privilege Escalation / Defense Evasion",
+          "severity": "High",
+          "summary": "Adversaries modify Group Policy objects to push malicious settings to many machines, or change AD permissions (ACLs) to grant themselves rights like replication or password reset.",
+          "indicators": [
+            "Changes to nTSecurityDescriptor on the domain root or AdminSDHolder.",
+            "GPO changes (gPCFileSysPath, versionNumber) by unexpected accounts.",
+            "msDS-AllowedToActOnBehalfOfOtherIdentity set on computer objects (delegation abuse)."
+          ],
+          "false_positives": [
+            "Normal GPO administration.",
+            "Delegation changes made by AD admins."
+          ],
+          "detection_flow": [
+            "5136 on DCs",
+            "Sensitive attribute?",
+            "Sensitive object?",
+            "Actor approved?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Watch a list of sensitive attributes: nTSecurityDescriptor, gPCFileSysPath, msDS-AllowedToActOnBehalfOfOtherIdentity, servicePrincipalName.",
+              "Alert when those change on sensitive objects or by non-approved accounts.",
+              "Alert on any change to AdminSDHolder."
+            ],
+            "investigate": [
+              "Diff the old/new values (paired 5136 events).",
+              "Review the GPO contents in SYSVOL if a GPO changed."
+            ],
+            "respond": [
+              "Revert the change.",
+              "Reset the actor's credentials and review its source host."
+            ],
+            "prevent": [
+              "Limit who can edit GPOs and ACLs.",
+              "Regularly review AD permissions with tools like BloodHound (defensively)."
+            ]
+          },
+          "pseudocode": [
+            "SENSITIVE_ATTRS = [\"nTSecurityDescriptor\", \"gPCFileSysPath\",",
+            "                   \"msDS-AllowedToActOnBehalfOfOtherIdentity\", \"servicePrincipalName\"]",
+            "FOR EACH event IN Security WHERE EventID == 5136 AND OperationType == \"Value Added\"",
+            "    IF event.ObjectDN CONTAINS \"CN=AdminSDHolder\": ALERT Critical \"AdminSDHolder modified\"",
+            "    ELSE IF event.AttributeLDAPDisplayName IN SENSITIVE_ATTRS",
+            "            AND event.SubjectUserName NOT IN approved_ad_admins:",
+            "        ALERT High event.AttributeLDAPDisplayName + \" changed on \" + event.ObjectDN"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "5140",
+      "name": "A network share object was accessed",
+      "log_source": "Security",
+      "category": "File Shares",
+      "description": "Logged when a user connects to a network share (once per session). It shows the share name and source address, making it useful for spotting access to admin shares like C$ and ADMIN$.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Object Access > Audit File Share (Success, Failure)."
+      ],
+      "key_fields": [
+        {
+          "field": "ShareName",
+          "why": "e.g. \\\\*\\C$, \\\\*\\ADMIN$, \\\\*\\IPC$."
+        },
+        {
+          "field": "IpAddress",
+          "why": "Who connected."
+        },
+        {
+          "field": "SubjectUserName",
+          "why": "Account used."
+        }
+      ],
+      "related": [
+        "5145",
+        "4624",
+        "7045"
+      ],
+      "attacks": [
+        {
+          "name": "Admin Share Lateral Movement",
+          "mitre_id": "T1021.002",
+          "tactic": "Lateral Movement",
+          "severity": "High",
+          "summary": "Adversaries with admin credentials connect to hidden admin shares (C$, ADMIN$) to copy tools to other machines, often followed by service or task creation to run them.",
+          "indicators": [
+            "ADMIN$ or C$ access from workstations rather than admin servers.",
+            "One account accessing admin shares on many hosts quickly.",
+            "Share access followed by 7045/4698 on the same host."
+          ],
+          "false_positives": [
+            "Software deployment and backup systems."
+          ],
+          "detection_flow": [
+            "5140 collected",
+            "Admin share?",
+            "Source expected?",
+            "Service/task follows?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Filter 5140 to ShareName ending in ADMIN$ or C$.",
+              "Exclude known management servers.",
+              "Count distinct target hosts per account per hour.",
+              "Correlate with 7045/4697/4698 on the target within 10 minutes."
+            ],
+            "investigate": [
+              "Check 5145 for which files were written.",
+              "Review the source host."
+            ],
+            "respond": [
+              "Contain source and target hosts.",
+              "Remove dropped files and services."
+            ],
+            "prevent": [
+              "Block SMB between workstations with host firewalls.",
+              "Use LAPS and restrict admin rights."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH event IN Security WHERE EventID == 5140",
+            "    IF event.ShareName ENDS WITH ANY (\"ADMIN$\", \"C$\") AND event.IpAddress NOT IN mgmt_servers:",
+            "        followed = EXISTS (7045 OR 4697 OR 4698) ON event.Computer WITHIN 10 minutes AFTER",
+            "        n = COUNT DISTINCT Computer FOR event.SubjectUserName WITH admin-share access IN 1 hour",
+            "        IF followed: ALERT High \"Admin share access + remote execution on \" + event.Computer",
+            "        ELSE IF n >= 3: ALERT Medium \"Admin share fan-out by \" + event.SubjectUserName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "5145",
+      "name": "A network share object was checked to see whether client can be granted desired access",
+      "log_source": "Security",
+      "category": "File Shares",
+      "description": "Detailed file share auditing: logged for each file or folder accessed through a share, with the relative path and access requested. High volume, but very informative for data theft and ransomware investigations.",
+      "how_to_enable": [
+        "Edit a GPO: Advanced Audit Policy > Object Access > Audit Detailed File Share (Success, Failure).",
+        "This is very noisy; consider enabling only on sensitive file servers and DCs."
+      ],
+      "key_fields": [
+        {
+          "field": "ShareName",
+          "why": "The share accessed."
+        },
+        {
+          "field": "RelativeTargetName",
+          "why": "The file or folder path."
+        },
+        {
+          "field": "AccessMask / AccessList",
+          "why": "Read, write, delete requests."
+        },
+        {
+          "field": "IpAddress / SubjectUserName",
+          "why": "Who accessed it."
+        }
+      ],
+      "related": [
+        "5140"
+      ],
+      "attacks": [
+        {
+          "name": "Data Collection / Ransomware over SMB",
+          "mitre_id": "T1039 / T1486",
+          "tactic": "Collection / Impact",
+          "severity": "High",
+          "summary": "Adversaries read large numbers of files from shared drives to steal data, or encrypt files on shares during a ransomware attack. Both produce unusual volumes of share file access from one source.",
+          "indicators": [
+            "One account reading far more files than its baseline.",
+            "Mass write + delete activity across many folders in minutes.",
+            "Access to rarely used sensitive folders."
+          ],
+          "false_positives": [
+            "Backups, indexing and migration jobs."
+          ],
+          "detection_flow": [
+            "5145 collected",
+            "Group by user",
+            "Volume vs baseline",
+            "Write/delete ratio",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Enable detailed share auditing on sensitive file servers.",
+              "Count files accessed per user per 10 minutes versus their baseline.",
+              "Count distinct files with write/delete access per source; spikes suggest encryption.",
+              "Place canary files in shares and alert on any access to them."
+            ],
+            "investigate": [
+              "Identify affected folders and the source host.",
+              "Check for ransom notes or renamed extensions."
+            ],
+            "respond": [
+              "Disconnect the source host and disable the account.",
+              "Restore from backups if encrypted."
+            ],
+            "prevent": [
+              "Least-privilege share permissions.",
+              "Offline/immutable backups."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH user IN GROUP Security WHERE EventID == 5145 BY SubjectUserName, IpAddress OVER 10 minutes",
+            "    reads  = COUNT DISTINCT RelativeTargetName WHERE AccessList CONTAINS \"ReadData\"",
+            "    writes = COUNT DISTINCT RelativeTargetName WHERE AccessList CONTAINS ANY (\"WriteData\", \"DELETE\")",
+            "    IF ANY RelativeTargetName IN canary_files: ALERT Critical \"Canary file touched\"",
+            "    IF writes >= 200: ALERT Critical \"Possible ransomware on shares from \" + user.IpAddress",
+            "    ELSE IF reads >= 10 * baseline_reads(user): ALERT High \"Bulk file collection by \" + user"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-1",
+      "aliases": [
+        "1"
+      ],
+      "name": "Sysmon: Process creation",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Sysmon's richer version of 4688: includes file hashes, full parent command line, process GUIDs for reliable correlation, and the original file name from the PE header (helps catch renamed binaries).",
+      "how_to_enable": [
+        "Download Sysmon from Microsoft Sysinternals.",
+        "Pick a maintained community configuration (e.g. SwiftOnSecurity or Olaf Hartong's sysmon-modular).",
+        "Install with 'sysmon64 -accepteula -i config.xml' on a test machine first.",
+        "Forward Microsoft-Windows-Sysmon/Operational to your SIEM."
+      ],
+      "key_fields": [
+        {
+          "field": "Image / OriginalFileName",
+          "why": "A mismatch reveals renamed binaries."
+        },
+        {
+          "field": "CommandLine / ParentCommandLine",
+          "why": "Full context of execution."
+        },
+        {
+          "field": "Hashes",
+          "why": "Check against threat intel."
+        },
+        {
+          "field": "ProcessGuid / ParentProcessGuid",
+          "why": "Reliable process-tree correlation."
+        }
+      ],
+      "related": [
+        "4688",
+        "Sysmon-3",
+        "Sysmon-11"
+      ],
+      "attacks": [
+        {
+          "name": "Masquerading (renamed or misplaced system binaries)",
+          "mitre_id": "T1036",
+          "tactic": "Defense Evasion",
+          "severity": "High",
+          "summary": "Adversaries rename tools to look like legitimate Windows programs, or place fake 'svchost.exe'-style files in the wrong folder, hoping analysts overlook them.",
+          "indicators": [
+            "OriginalFileName differs from the Image file name.",
+            "System process names (svchost, lsass, csrss) running from outside System32.",
+            "svchost.exe with a parent other than services.exe."
+          ],
+          "false_positives": [
+            "Some software legitimately renames bundled utilities."
+          ],
+          "detection_flow": [
+            "Sysmon 1",
+            "Compare names",
+            "Check path",
+            "Check parent",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Compare OriginalFileName to the file name in Image.",
+              "Keep a list of core system process names with their expected paths and parents.",
+              "Alert on path or parent mismatches."
+            ],
+            "investigate": [
+              "Hash lookup of the binary.",
+              "Review its network connections and child processes."
+            ],
+            "respond": [
+              "Kill the process, quarantine the file, isolate the host."
+            ],
+            "prevent": [
+              "Application control based on publisher and path."
+            ]
+          },
+          "pseudocode": [
+            "EXPECTED = { \"svchost.exe\": (\"C:\\\\Windows\\\\System32\\\\\", \"services.exe\"),",
+            "             \"lsass.exe\":   (\"C:\\\\Windows\\\\System32\\\\\", \"wininit.exe\") }",
+            "FOR EACH e IN Sysmon WHERE EventID == 1",
+            "    name = basename(e.Image)",
+            "    IF e.OriginalFileName NOT EMPTY AND lower(e.OriginalFileName) != lower(name)",
+            "       AND lower(e.OriginalFileName) IN watched_binaries:",
+            "        ALERT High \"Renamed binary: \" + e.OriginalFileName + \" as \" + name",
+            "    IF name IN EXPECTED:",
+            "        (path, parent) = EXPECTED[name]",
+            "        IF NOT e.Image STARTS WITH path OR basename(e.ParentImage) != parent:",
+            "            ALERT High \"System process masquerading: \" + e.Image"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-3",
+      "aliases": [
+        "3"
+      ],
+      "name": "Sysmon: Network connection",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Records TCP/UDP connections with the process that made them. It links network activity to programs, which firewall logs alone cannot do.",
+      "how_to_enable": [
+        "Install Sysmon with a config that includes NetworkConnect rules (usually filtered to reduce volume)."
+      ],
+      "key_fields": [
+        {
+          "field": "Image",
+          "why": "Process making the connection."
+        },
+        {
+          "field": "DestinationIp / DestinationPort / DestinationHostname",
+          "why": "Where it connected."
+        },
+        {
+          "field": "Initiated",
+          "why": "true = outbound."
+        }
+      ],
+      "related": [
+        "Sysmon-1",
+        "Sysmon-22"
+      ],
+      "attacks": [
+        {
+          "name": "Command and Control Beaconing",
+          "mitre_id": "T1071",
+          "tactic": "Command and Control",
+          "severity": "High",
+          "summary": "Malware regularly 'checks in' with the adversary's server to receive instructions. This produces repeated, evenly spaced connections from an unusual process to the same destination.",
+          "indicators": [
+            "Connections at very regular intervals (low jitter).",
+            "Script interpreters or LOLBins making outbound connections.",
+            "Connections to rare or newly registered domains/IPs."
+          ],
+          "false_positives": [
+            "Update agents and telemetry services also beacon regularly."
+          ],
+          "detection_flow": [
+            "Sysmon 3",
+            "Group proc+dest",
+            "Measure intervals",
+            "Rarity check",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Group connections by (host, Image, DestinationIp/Hostname).",
+              "Compute the time between connections and its variation; very regular intervals are suspicious.",
+              "Score rarity: how many hosts in your environment talk to that destination?",
+              "Alert on script interpreters with outbound connections to public IPs."
+            ],
+            "investigate": [
+              "Review the process tree and file on disk.",
+              "Check the destination against threat intelligence."
+            ],
+            "respond": [
+              "Block the destination at proxy/firewall.",
+              "Isolate the host."
+            ],
+            "prevent": [
+              "Egress filtering and authenticated proxies.",
+              "DNS filtering."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH (host, image, dest) IN GROUP Sysmon WHERE EventID == 3 AND Initiated == true OVER 24 hours",
+            "    times = SORT(event.UtcTime); gaps = DIFF(times)",
+            "    IF COUNT(gaps) >= 20:",
+            "        jitter = STDDEV(gaps) / MEAN(gaps)",
+            "        rarity = COUNT DISTINCT host CONNECTING TO dest IN 7 days",
+            "        IF jitter < 0.2 AND rarity <= 2: ALERT High \"Possible C2 beacon: \" + image + \" -> \" + dest",
+            "FOR EACH e IN Sysmon WHERE EventID == 3 AND basename(e.Image) IN INTERPRETERS AND is_public(e.DestinationIp)",
+            "    ALERT Medium \"Interpreter made outbound connection\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-8",
+      "aliases": [
+        "8"
+      ],
+      "name": "Sysmon: CreateRemoteThread",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Logged when one process creates a thread inside another process. This is a classic sign of process injection, where malicious code hides inside a legitimate process.",
+      "how_to_enable": [
+        "Install Sysmon with a config that includes CreateRemoteThread rules."
+      ],
+      "key_fields": [
+        {
+          "field": "SourceImage",
+          "why": "Process creating the thread."
+        },
+        {
+          "field": "TargetImage",
+          "why": "Process receiving the thread."
+        },
+        {
+          "field": "StartAddress / StartModule",
+          "why": "Empty StartModule suggests injected code."
+        }
+      ],
+      "related": [
+        "Sysmon-10",
+        "Sysmon-1"
+      ],
+      "attacks": [
+        {
+          "name": "Process Injection",
+          "mitre_id": "T1055",
+          "tactic": "Defense Evasion / Privilege Escalation",
+          "severity": "High",
+          "summary": "Adversaries run their code inside another process's memory so it inherits that process's trust and privileges and is harder to spot in process lists.",
+          "indicators": [
+            "Unusual SourceImage (scripting host, Office, unknown binary) creating threads in other processes.",
+            "Target processes like explorer.exe, svchost.exe, lsass.exe.",
+            "StartModule empty or not a known DLL."
+          ],
+          "false_positives": [
+            "Debuggers, some security products, and accessibility tools."
+          ],
+          "detection_flow": [
+            "Sysmon 8",
+            "Allow-list source",
+            "Sensitive target?",
+            "Start module check",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Allow-list known legitimate SourceImage values (EDR, debuggers).",
+              "Alert on remaining events, with higher severity for sensitive targets.",
+              "Flag events where StartModule is empty."
+            ],
+            "investigate": [
+              "Capture memory of the target process if possible.",
+              "Examine the source binary."
+            ],
+            "respond": [
+              "Isolate the host and terminate both processes."
+            ],
+            "prevent": [
+              "Enable ASR rules and EDR memory protection features."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH e IN Sysmon WHERE EventID == 8",
+            "    IF basename(e.SourceImage) IN injection_allow_list: CONTINUE",
+            "    sev = \"Medium\"",
+            "    IF basename(e.TargetImage) IN (\"lsass.exe\", \"explorer.exe\", \"svchost.exe\", \"winlogon.exe\"): sev = \"High\"",
+            "    IF e.StartModule IS EMPTY: sev = \"High\"",
+            "    ALERT sev \"Remote thread: \" + e.SourceImage + \" -> \" + e.TargetImage"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-10",
+      "aliases": [
+        "10"
+      ],
+      "name": "Sysmon: Process accessed",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Logged when one process opens a handle to another. Filtering for access to lsass.exe (which holds credentials in memory) makes this a key event for detecting credential theft.",
+      "how_to_enable": [
+        "Install Sysmon with ProcessAccess rules that include TargetImage lsass.exe.",
+        "Filter carefully; unfiltered ProcessAccess is extremely noisy."
+      ],
+      "key_fields": [
+        {
+          "field": "SourceImage",
+          "why": "Process requesting access."
+        },
+        {
+          "field": "TargetImage",
+          "why": "Process being accessed (e.g. lsass.exe)."
+        },
+        {
+          "field": "GrantedAccess",
+          "why": "Rights requested; memory-read masks such as 0x1010 or 0x1410 are suspicious for LSASS."
+        },
+        {
+          "field": "CallTrace",
+          "why": "Unknown modules in the trace can indicate injected or unusual code."
+        }
+      ],
+      "related": [
+        "4624",
+        "Sysmon-8",
+        "4776"
+      ],
+      "attacks": [
+        {
+          "name": "LSASS Credential Dumping",
+          "mitre_id": "T1003.001",
+          "tactic": "Credential Access",
+          "severity": "Critical",
+          "summary": "The LSASS process stores credential material for logged-on users. Adversaries with admin rights read its memory to extract hashes, tickets or passwords for later reuse (pass-the-hash, pass-the-ticket).",
+          "indicators": [
+            "Non-system processes opening lsass.exe with memory-read access rights.",
+            "Access from unsigned binaries, scripting hosts, or tools running from Temp.",
+            "A crash-dump-style file of LSASS written to disk (see Sysmon 11)."
+          ],
+          "false_positives": [
+            "Antivirus/EDR agents.",
+            "Windows Error Reporting and some management tools."
+          ],
+          "detection_flow": [
+            "Sysmon 10",
+            "Target = lsass",
+            "Allow-list source",
+            "Check access mask",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Filter Sysmon 10 to TargetImage ending in lsass.exe.",
+              "Allow-list known security products and Windows components by path and signer.",
+              "Alert when GrantedAccess includes memory-read rights (e.g. 0x10 PROCESS_VM_READ).",
+              "Correlate with Sysmon 11 for .dmp files created around the same time."
+            ],
+            "investigate": [
+              "Identify the source binary, its hash and parent chain.",
+              "Assume credentials of all users logged on to that host are compromised; list them."
+            ],
+            "respond": [
+              "Isolate the host.",
+              "Reset passwords for every account that had a session on the host.",
+              "Hunt for use of those accounts elsewhere (4624/4776)."
+            ],
+            "prevent": [
+              "Enable LSA Protection (RunAsPPL) and Credential Guard.",
+              "Enable the ASR rule 'Block credential stealing from LSASS'.",
+              "Minimize privileged logons to workstations."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH e IN Sysmon WHERE EventID == 10 AND lower(e.TargetImage) ENDS WITH \"\\\\lsass.exe\"",
+            "    IF (e.SourceImage, signer(e.SourceImage)) IN lsass_access_allow_list: CONTINUE",
+            "    mask = HEX_TO_INT(e.GrantedAccess)",
+            "    IF mask AND 0x10:                        // PROCESS_VM_READ",
+            "        ALERT Critical \"LSASS memory access by \" + e.SourceImage",
+            "        IF EXISTS Sysmon 11 WHERE TargetFilename ENDS WITH \".dmp\" ON e.Computer WITHIN 5 minutes:",
+            "            ESCALATE \"LSASS dump file written\""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-11",
+      "aliases": [
+        "11"
+      ],
+      "name": "Sysmon: File created",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Logged when a file is created or overwritten. Useful for spotting dropped payloads, files in startup folders, dump files, and ransomware notes.",
+      "how_to_enable": [
+        "Install Sysmon with FileCreate rules for high-value paths (Startup, Temp, ProgramData, .dmp, script extensions)."
+      ],
+      "key_fields": [
+        {
+          "field": "Image",
+          "why": "Process that wrote the file."
+        },
+        {
+          "field": "TargetFilename",
+          "why": "Where and what was written."
+        }
+      ],
+      "related": [
+        "Sysmon-1",
+        "Sysmon-10"
+      ],
+      "attacks": [
+        {
+          "name": "Startup Folder Persistence & Payload Drops",
+          "mitre_id": "T1547.001 / T1105",
+          "tactic": "Persistence / Command and Control",
+          "severity": "Medium",
+          "summary": "Adversaries write files into Startup folders so they run at logon, and drop executables or scripts downloaded from the internet into user-writable locations.",
+          "indicators": [
+            "New files in Startup folders.",
+            "Executables or scripts written by Office apps, browsers or script interpreters.",
+            "Executables in Temp or Public folders."
+          ],
+          "false_positives": [
+            "Software installers.",
+            "Users downloading legitimate tools."
+          ],
+          "detection_flow": [
+            "Sysmon 11",
+            "Path of interest?",
+            "Risky extension?",
+            "Writer process?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Alert on any file created in Startup folders.",
+              "Alert when Office apps or interpreters write executable/script extensions.",
+              "Correlate with a later Sysmon 1 execution of the same file."
+            ],
+            "investigate": [
+              "Hash and analyze the file.",
+              "Find how it arrived (email, browser download, network share)."
+            ],
+            "respond": [
+              "Quarantine the file and isolate the host if it executed."
+            ],
+            "prevent": [
+              "ASR rules blocking Office from creating executable content.",
+              "Application control."
+            ]
+          },
+          "pseudocode": [
+            "EXEC_EXT = [\".exe\", \".dll\", \".ps1\", \".vbs\", \".js\", \".hta\", \".bat\", \".lnk\"]",
+            "FOR EACH e IN Sysmon WHERE EventID == 11",
+            "    f = lower(e.TargetFilename); writer = basename(e.Image)",
+            "    IF f CONTAINS \"\\\\start menu\\\\programs\\\\startup\\\\\": ALERT Medium \"Startup folder file: \" + f",
+            "    IF extension(f) IN EXEC_EXT AND writer IN (RISKY_PARENTS + INTERPRETERS):",
+            "        ALERT High writer + \" wrote executable content: \" + f"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-13",
+      "aliases": [
+        "13"
+      ],
+      "name": "Sysmon: Registry value set",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Logged when a registry value is written. Focused on autostart locations, it catches one of the most common persistence methods.",
+      "how_to_enable": [
+        "Install Sysmon with RegistryEvent rules for Run/RunOnce, Services, Winlogon, IFEO and similar autostart keys."
+      ],
+      "key_fields": [
+        {
+          "field": "TargetObject",
+          "why": "Registry path written."
+        },
+        {
+          "field": "Details",
+          "why": "Value data (often the command that will run)."
+        },
+        {
+          "field": "Image",
+          "why": "Process that wrote it."
+        }
+      ],
+      "related": [
+        "4657",
+        "Sysmon-1"
+      ],
+      "attacks": [
+        {
+          "name": "Registry Run Key Persistence",
+          "mitre_id": "T1547.001",
+          "tactic": "Persistence",
+          "severity": "Medium",
+          "summary": "Adding a value under Run/RunOnce keys makes a program start every time a user logs on. It is simple, common, and easy to detect when monitored.",
+          "indicators": [
+            "New values under ...\\CurrentVersion\\Run or RunOnce.",
+            "Values pointing to user-writable paths or script interpreters.",
+            "Writes by unusual processes (scripts, Office)."
+          ],
+          "false_positives": [
+            "Many legitimate apps add Run keys on install."
+          ],
+          "detection_flow": [
+            "Sysmon 13",
+            "Autostart key?",
+            "Check value data",
+            "Writer process?",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Filter TargetObject to autostart keys (Run, RunOnce, Winlogon Shell/Userinit, IFEO Debugger).",
+              "Score Details for interpreters, encoded content, or user-writable paths.",
+              "Alert on high scores; log the rest for weekly review."
+            ],
+            "investigate": [
+              "Inspect the referenced file.",
+              "Check which process wrote the key and how it started."
+            ],
+            "respond": [
+              "Delete the value and the referenced file."
+            ],
+            "prevent": [
+              "Limit admin rights (HKLM keys need admin).",
+              "Application control."
+            ]
+          },
+          "pseudocode": [
+            "AUTOSTART = [\"\\\\currentversion\\\\run\", \"\\\\currentversion\\\\runonce\",",
+            "             \"\\\\winlogon\\\\shell\", \"\\\\winlogon\\\\userinit\", \"\\\\image file execution options\\\\\"]",
+            "FOR EACH e IN Sysmon WHERE EventID == 13",
+            "    IF lower(e.TargetObject) CONTAINS ANY AUTOSTART:",
+            "        score = 0",
+            "        IF references_user_writable_path(e.Details): score += 2",
+            "        IF lower(e.Details) CONTAINS ANY INTERPRETERS: score += 2",
+            "        IF basename(e.Image) IN (INTERPRETERS + RISKY_PARENTS): score += 1",
+            "        IF score >= 2: ALERT Medium \"Suspicious autostart entry: \" + e.TargetObject"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Sysmon-22",
+      "aliases": [
+        "22"
+      ],
+      "name": "Sysmon: DNS query",
+      "log_source": "Microsoft-Windows-Sysmon/Operational",
+      "category": "Sysmon",
+      "description": "Records DNS lookups along with the process that made them. It lets you tie suspicious domains directly to programs.",
+      "how_to_enable": [
+        "Install Sysmon (v10+) with DnsQuery rules; exclude very common domains to reduce volume."
+      ],
+      "key_fields": [
+        {
+          "field": "QueryName",
+          "why": "Domain looked up."
+        },
+        {
+          "field": "Image",
+          "why": "Process that looked it up."
+        },
+        {
+          "field": "QueryResults",
+          "why": "Returned addresses."
+        }
+      ],
+      "related": [
+        "Sysmon-3"
+      ],
+      "attacks": [
+        {
+          "name": "DNS-based C2 and Tunneling",
+          "mitre_id": "T1071.004 / T1568.002",
+          "tactic": "Command and Control / Exfiltration",
+          "severity": "High",
+          "summary": "Malware can hide communications inside DNS queries, or generate many random domain names (DGA) to find its server. Both create unusual DNS patterns.",
+          "indicators": [
+            "Very long or high-entropy subdomains.",
+            "Large numbers of unique subdomains of one parent domain from one host.",
+            "Many NXDOMAIN-style lookups of random names."
+          ],
+          "false_positives": [
+            "CDNs and some security products use long generated names."
+          ],
+          "detection_flow": [
+            "Sysmon 22",
+            "Measure entropy",
+            "Count subdomains",
+            "Rarity check",
+            "Alert SOC"
+          ],
+          "defense": {
+            "detect": [
+              "Compute length and entropy of the left-most labels of QueryName.",
+              "Count unique subdomains per parent domain per host per hour.",
+              "Weight by rarity of the parent domain across the environment.",
+              "Allow-list known CDNs and security vendors."
+            ],
+            "investigate": [
+              "Identify the process and inspect it.",
+              "Look up the parent domain's registration age."
+            ],
+            "respond": [
+              "Sinkhole or block the domain.",
+              "Isolate the host."
+            ],
+            "prevent": [
+              "Force all DNS through internal resolvers with filtering.",
+              "Block direct outbound DNS (port 53) from endpoints."
+            ]
+          },
+          "pseudocode": [
+            "FOR EACH (host, parent) IN GROUP Sysmon WHERE EventID == 22 BY Computer, registered_domain(QueryName) OVER 1 hour",
+            "    IF parent IN dns_allow_list: CONTINUE",
+            "    subs = DISTINCT subdomain(QueryName)",
+            "    avg_entropy = MEAN(entropy(s) FOR s IN subs); avg_len = MEAN(length(s) FOR s IN subs)",
+            "    IF COUNT(subs) >= 50 AND (avg_entropy > 3.8 OR avg_len > 40):",
+            "        ALERT High \"Possible DNS tunneling to \" + parent + \" from \" + host"
+          ]
+        }
+      ]
+    }
+  ]
+}
